@@ -56,14 +56,18 @@ async def _run(args: argparse.Namespace, settings: Settings) -> None:
             async with BinanceRestClient(
                 timeout_seconds=settings.rest_timeout_seconds
             ) as rest_client:
-                count = await SymbolService(repository, rest_client).sync_symbols()
+                count = await SymbolService(
+                    repository,
+                    rest_client,
+                    default_funding_interval_hours=settings.default_funding_interval_hours,
+                ).sync_symbols()
         print(f"synced symbols: {count}")
         return
 
     if args.command == "status":
         async with database:
             repository = FundingRepository(database)
-            summary = await repository.status_summary()
+            summary = await repository.status_summary(settings.abs_min_funding_rate)
         print(f"active_symbols: {summary['active_symbols']}")
         print(f"snapshots: {summary['snapshot_count']}")
         print(f"funding_events: {summary['event_count']}")
@@ -71,6 +75,29 @@ async def _run(args: argparse.Namespace, settings: Settings) -> None:
         print(f"waiting: {summary['waiting']}")
         print(f"confirmed: {summary['confirmed']}")
         print(f"confirmation_failed: {summary['confirmation_failed']}")
+        print(f"positive_snapshots: {summary['positive_snapshots']}")
+        print(f"negative_snapshots: {summary['negative_snapshots']}")
+        print(f"neutral_snapshots: {summary['neutral_snapshots']}")
+        print(
+            "snapshots_above_abs_threshold: "
+            f"{summary['snapshots_above_abs_threshold']}"
+        )
+        print(
+            "snapshots_below_abs_threshold: "
+            f"{summary['snapshots_below_abs_threshold']}"
+        )
+        print(f"next_funding_time_min: {summary['next_funding_time_min'] or ''}")
+        print(f"latest_received_at: {summary['latest_received_at'] or ''}")
+        return
+
+    if args.command == "snapshot-stats":
+        async with database:
+            repository = FundingRepository(database)
+            stats = await repository.snapshot_stats(
+                abs_threshold=settings.abs_min_funding_rate,
+                minutes=args.minutes,
+            )
+        _print_snapshot_stats(stats)
         return
 
     if args.command == "recent-events":
@@ -125,6 +152,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("status")
 
+    stats_parser = subparsers.add_parser("snapshot-stats")
+    stats_parser.add_argument("--minutes", type=int, default=None)
+
     recent_parser = subparsers.add_parser("recent-events")
     recent_parser.add_argument("--limit", type=int, default=20)
 
@@ -132,6 +162,26 @@ def _build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--output", type=Path, required=True)
 
     return parser
+
+
+def _print_snapshot_stats(stats: dict[str, object]) -> None:
+    print(f"total_snapshots: {stats['total_snapshots']}")
+    print(f"symbols_represented: {stats['symbols_represented']}")
+    print(f"positive_count: {stats['positive_count']}")
+    print(f"negative_count: {stats['negative_count']}")
+    print(f"neutral_count: {stats['neutral_count']}")
+    print(f"above_threshold_count: {stats['above_threshold_count']}")
+    print(f"below_threshold_count: {stats['below_threshold_count']}")
+    print(f"min_funding_rate: {stats['min_funding_rate'] or ''}")
+    print(f"max_funding_rate: {stats['max_funding_rate'] or ''}")
+    print(
+        "average_absolute_funding_rate: "
+        f"{stats['average_absolute_funding_rate'] or ''}"
+    )
+    print(f"earliest_next_funding: {stats['earliest_next_funding'] or ''}")
+    print(f"latest_next_funding: {stats['latest_next_funding'] or ''}")
+    print(f"newest_snapshot: {stats['newest_snapshot'] or ''}")
+    print(f"oldest_snapshot: {stats['oldest_snapshot'] or ''}")
 
 
 def _print_recent_events(events: list[FundingEvent]) -> None:

@@ -4,7 +4,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from .models import FundingSnapshot, MarkPriceUpdate, utc_now
+from .models import (
+    FundingSnapshot,
+    MarkPriceUpdate,
+    calculate_premium_rate,
+    calculate_seconds_to_funding,
+    funding_direction_from_rate,
+    utc_now,
+)
 
 CaptureMode = str
 
@@ -58,8 +65,10 @@ def snapshot_from_update(
     update: MarkPriceUpdate,
     *,
     capture_mode: CaptureMode,
+    funding_interval_hours: int,
     received_at: datetime | None = None,
 ) -> FundingSnapshot:
+    funding_rate = update.predicted_funding_rate
     return FundingSnapshot(
         symbol=update.symbol,
         event_time=update.event_time,
@@ -68,9 +77,16 @@ def snapshot_from_update(
         index_price=update.index_price,
         estimated_settle_price=update.estimated_settle_price,
         predicted_funding_rate=update.predicted_funding_rate,
+        funding_rate=funding_rate,
         interest_rate=update.interest_rate,
         next_funding_time=update.next_funding_time,
         seconds_until_funding=update.seconds_until_funding,
+        seconds_to_funding=calculate_seconds_to_funding(
+            update.event_time, update.next_funding_time
+        ),
+        premium_rate=calculate_premium_rate(update.mark_price, update.index_price),
+        funding_direction=funding_direction_from_rate(funding_rate),
+        funding_interval_hours=funding_interval_hours,
         capture_mode=capture_mode,
     )
 

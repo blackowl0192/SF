@@ -8,7 +8,13 @@ from funding_monitor.funding_event_service import (
     FundingConfirmationScheduler,
     FundingEventService,
 )
-from funding_monitor.models import FundingEvent, FundingSnapshot, utc_datetime_to_millis
+from funding_monitor.models import (
+    FundingEvent,
+    FundingSnapshot,
+    calculate_premium_rate,
+    funding_direction_from_rate,
+    utc_datetime_to_millis,
+)
 from funding_monitor.snapshot_service import select_checkpoint_rates
 
 
@@ -18,17 +24,25 @@ def make_snapshot(
     rate: str,
 ) -> FundingSnapshot:
     event_time = funding_time - timedelta(seconds=seconds_before)
+    funding_rate = Decimal(rate)
+    mark_price = Decimal("43000.0")
+    index_price = Decimal("42990.0")
     return FundingSnapshot(
         symbol="BTCUSDT",
         event_time=event_time,
         received_at=event_time,
-        mark_price=Decimal("43000.0"),
-        index_price=Decimal("42990.0"),
+        mark_price=mark_price,
+        index_price=index_price,
         estimated_settle_price=None,
-        predicted_funding_rate=Decimal(rate),
+        predicted_funding_rate=funding_rate,
+        funding_rate=funding_rate,
         interest_rate=None,
         next_funding_time=funding_time,
         seconds_until_funding=seconds_before,
+        seconds_to_funding=max(0, seconds_before),
+        premium_rate=calculate_premium_rate(mark_price, index_price),
+        funding_direction=funding_direction_from_rate(funding_rate),
+        funding_interval_hours=8,
         capture_mode="pre_funding",
     )
 
@@ -170,7 +184,10 @@ class InMemoryRepository:
 
     async def insert_snapshot(self, snapshot: FundingSnapshot) -> bool:
         key = (snapshot.symbol, snapshot.event_time, snapshot.capture_mode)
-        if any((item.symbol, item.event_time, item.capture_mode) == key for item in self.snapshots):
+        if any(
+            (item.symbol, item.event_time, item.capture_mode) == key
+            for item in self.snapshots
+        ):
             return False
         self.snapshots.append(snapshot)
         return True

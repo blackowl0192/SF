@@ -12,8 +12,11 @@ from .models import (
     FundingEvent,
     FundingSnapshot,
     SymbolRecord,
+    calculate_premium_rate,
+    calculate_seconds_to_funding,
     decimal_from_text,
     ensure_utc,
+    funding_direction_from_rate,
 )
 
 UPSERT_SYMBOLS_SQL = """
@@ -49,12 +52,17 @@ INSERT INTO funding_snapshots (
     index_price,
     estimated_settle_price,
     predicted_funding_rate,
+    funding_rate,
     interest_rate,
     next_funding_time,
     seconds_until_funding,
+    seconds_to_funding,
+    premium_rate,
+    funding_direction,
+    funding_interval_hours,
     capture_mode
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 ON CONFLICT(symbol, event_time, capture_mode) DO NOTHING
 RETURNING id
 """
@@ -161,9 +169,14 @@ class FundingRepository:
                 snapshot.index_price,
                 snapshot.estimated_settle_price,
                 snapshot.predicted_funding_rate,
+                snapshot.funding_rate,
                 snapshot.interest_rate,
                 ensure_utc(snapshot.next_funding_time),
                 snapshot.seconds_until_funding,
+                snapshot.seconds_to_funding,
+                snapshot.premium_rate,
+                snapshot.funding_direction,
+                snapshot.funding_interval_hours,
                 snapshot.capture_mode,
             )
         return row is not None
@@ -286,7 +299,9 @@ class FundingRepository:
                 ensure_utc(previous_funding_time),
             )
 
-    async def status_summary(self) -> dict[str, Any]:
+    async def status_summary(
+        self, abs_threshold: Decimal = Decimal("0.0003")
+    ) -> dict[str, Any]:
         async with self.database.acquire() as connection:
             active_symbols = await connection.fetchval(
                 "SELECT COUNT(*) FROM symbols WHERE is_active = TRUE"
@@ -299,6 +314,25 @@ class FundingRepository:
             )
             last_snapshot = await connection.fetchval(
                 "SELECT MAX(event_time) FROM funding_snapshots"
+            )
+            snapshot_stats = await connection.fetchrow(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE funding_direction = 'positive')
+                        AS positive_snapshots,
+                    COUNT(*) FILTER (WHERE funding_direction = 'negative')
+                        AS negative_snapshots,
+                    COUNT(*) FILTER (WHERE funding_direction = 'neutral')
+                        AS neutral_snapshots,
+                    COUNT(*) FILTER (WHERE ABS(funding_rate) >= $1)
+                        AS snapshots_above_abs_threshold,
+                    COUNT(*) FILTER (WHERE ABS(funding_rate) < $1)
+                        AS snapshots_below_abs_threshold,
+                    MIN(next_funding_time) AS next_funding_time_min,
+                    MAX(received_at) AS latest_received_at
+                FROM funding_snapshots
+                """,
+                abs_threshold,
             )
             status_rows = await connection.fetch(
                 """
@@ -316,6 +350,50 @@ class FundingRepository:
             "waiting": statuses.get("waiting", 0),
             "confirmed": statuses.get("confirmed", 0),
             "confirmation_failed": statuses.get("confirmation_failed", 0),
+            "positive_snapshots": int(snapshot_stats["positive_snapshots"] or 0),
+            "negative_snapshots": int(snapshot_stats["negative_snapshots"] or 0),
+            "neutral_snapshots": int(snapshot_stats["neutral_snapshots"] or 0),
+            "snapshots_above_abs_threshold": int(
+                snapshot_stats["snapshots_above_abs_threshold"] or 0
+            ),
+            "snapshots_below_abs_threshold": int(
+                snapshot_stats["snapshots_below_abs_threshold"] or 0
+            ),
+            "next_funding_time_min": snapshot_stats["next_funding_time_min"],
+            "latest_received_at": snapshot_stats["latest_received_at"],
+        }
+
+    async def snapshot_stats(
+        self, *, abs_threshold: Decimal, minutes: int | None = None
+    ) -> dict[str, Any]:
+        if minutes is None:
+            query = _SNAPSHOT_STATS_SQL
+            args: tuple[Any, ...] = (abs_threshold,)
+        else:
+            query = (
+                f"{_SNAPSHOT_STATS_SQL}\n"
+                "WHERE received_at >= NOW() - make_interval(mins => $2::int)"
+            )
+            args = (abs_threshold, minutes)
+
+        async with self.database.acquire() as connection:
+            row = await connection.fetchrow(query, *args)
+
+        return {
+            "total_snapshots": int(row["total_snapshots"] or 0),
+            "symbols_represented": int(row["symbols_represented"] or 0),
+            "positive_count": int(row["positive_count"] or 0),
+            "negative_count": int(row["negative_count"] or 0),
+            "neutral_count": int(row["neutral_count"] or 0),
+            "above_threshold_count": int(row["above_threshold_count"] or 0),
+            "below_threshold_count": int(row["below_threshold_count"] or 0),
+            "min_funding_rate": row["min_funding_rate"],
+            "max_funding_rate": row["max_funding_rate"],
+            "average_absolute_funding_rate": row["average_absolute_funding_rate"],
+            "earliest_next_funding": row["earliest_next_funding"],
+            "latest_next_funding": row["latest_next_funding"],
+            "newest_snapshot": row["newest_snapshot"],
+            "oldest_snapshot": row["oldest_snapshot"],
         }
 
     async def recent_events(self, limit: int) -> list[FundingEvent]:
@@ -390,11 +468,39 @@ class FundingRepository:
             if row["estimated_settle_price"] is not None
             else None,
             predicted_funding_rate=decimal_from_text(row["predicted_funding_rate"]),
+            funding_rate=decimal_from_text(
+                _row_value(row, "funding_rate", row["predicted_funding_rate"])
+            ),
             interest_rate=decimal_from_text(row["interest_rate"])
             if row["interest_rate"] is not None
             else None,
             next_funding_time=ensure_utc(row["next_funding_time"]),
             seconds_until_funding=int(row["seconds_until_funding"]),
+            seconds_to_funding=int(
+                _row_value(
+                    row,
+                    "seconds_to_funding",
+                    calculate_seconds_to_funding(
+                        row["event_time"], row["next_funding_time"]
+                    ),
+                )
+            ),
+            premium_rate=decimal_from_text(_row_value(row, "premium_rate", None))
+            if _row_value(row, "premium_rate", None) is not None
+            else calculate_premium_rate(
+                decimal_from_text(row["mark_price"]),
+                decimal_from_text(row["index_price"])
+                if row["index_price"] is not None
+                else None,
+            ),
+            funding_direction=_row_value(
+                row,
+                "funding_direction",
+                funding_direction_from_rate(
+                    decimal_from_text(row["predicted_funding_rate"])
+                ),
+            ),
+            funding_interval_hours=int(_row_value(row, "funding_interval_hours", 8)),
             capture_mode=row["capture_mode"],
         )
 
@@ -426,3 +532,30 @@ class FundingRepository:
 
     def _optional_decimal(self, row: Mapping[str, Any], key: str) -> Decimal | None:
         return decimal_from_text(row[key]) if row[key] is not None else None
+
+
+_SNAPSHOT_STATS_SQL = """
+SELECT
+    COUNT(*) AS total_snapshots,
+    COUNT(DISTINCT symbol) AS symbols_represented,
+    COUNT(*) FILTER (WHERE funding_direction = 'positive') AS positive_count,
+    COUNT(*) FILTER (WHERE funding_direction = 'negative') AS negative_count,
+    COUNT(*) FILTER (WHERE funding_direction = 'neutral') AS neutral_count,
+    COUNT(*) FILTER (WHERE ABS(funding_rate) >= $1) AS above_threshold_count,
+    COUNT(*) FILTER (WHERE ABS(funding_rate) < $1) AS below_threshold_count,
+    MIN(funding_rate) AS min_funding_rate,
+    MAX(funding_rate) AS max_funding_rate,
+    AVG(ABS(funding_rate)) AS average_absolute_funding_rate,
+    MIN(next_funding_time) AS earliest_next_funding,
+    MAX(next_funding_time) AS latest_next_funding,
+    MAX(received_at) AS newest_snapshot,
+    MIN(received_at) AS oldest_snapshot
+FROM funding_snapshots
+"""
+
+
+def _row_value(row: Mapping[str, Any], key: str, default: Any) -> Any:
+    try:
+        return row[key]
+    except KeyError:
+        return default

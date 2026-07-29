@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+FundingDirection = Literal["positive", "negative", "neutral"]
 
 
 def utc_now() -> datetime:
@@ -65,6 +67,35 @@ def decimal_to_percentage_point_text(value: str | Decimal | None) -> str:
     return decimal_to_percent_text(value)
 
 
+def funding_direction_from_rate(rate: Decimal) -> FundingDirection:
+    if rate > 0:
+        return "positive"
+    if rate < 0:
+        return "negative"
+    return "neutral"
+
+
+def is_above_abs_threshold(rate: Decimal, threshold: Decimal) -> bool:
+    return abs(rate) >= threshold
+
+
+def calculate_premium_rate(
+    mark_price: Decimal, index_price: Decimal | None
+) -> Decimal | None:
+    if index_price is None or index_price == 0:
+        return None
+    return (mark_price - index_price) / index_price
+
+
+def calculate_seconds_to_funding(
+    event_time: datetime, next_funding_time: datetime
+) -> int:
+    seconds = int(
+        (ensure_utc(next_funding_time) - ensure_utc(event_time)).total_seconds()
+    )
+    return max(0, seconds)
+
+
 @dataclass(frozen=True)
 class SymbolRecord:
     symbol: str
@@ -103,9 +134,14 @@ class FundingSnapshot:
     index_price: Decimal | None
     estimated_settle_price: Decimal | None
     predicted_funding_rate: Decimal
+    funding_rate: Decimal
     interest_rate: Decimal | None
     next_funding_time: datetime
     seconds_until_funding: int
+    seconds_to_funding: int
+    premium_rate: Decimal | None
+    funding_direction: FundingDirection
+    funding_interval_hours: int
     capture_mode: str
 
 

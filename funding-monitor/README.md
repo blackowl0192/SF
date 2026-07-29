@@ -4,6 +4,61 @@
 
 `funding-monitor` collects public Binance USD-M Futures data for predicted and actual funding rates. Runtime storage uses Supabase PostgreSQL through `asyncpg`.
 
+## Current Project Status
+
+### Completed Functionality
+
+- Python + asyncio runtime.
+- Binance REST access through `httpx`.
+- Binance WebSocket access through `websockets`.
+- Supabase PostgreSQL storage through `asyncpg`.
+- SQL migrations with `schema_migrations`.
+- `check-db` command for PostgreSQL connectivity.
+- 529 Binance USD-M perpetual symbols have been synchronized in live use.
+- WebSocket endpoint:
+  `wss://fstream.binance.com/market/ws/!markPrice@arr@1s`
+- WebSocket collector stores snapshots in PostgreSQL.
+- Funding events are created from stored snapshots.
+- Funding event lifecycle works: `waiting` to `confirmed`, or `confirmation_failed`.
+- Confirmed funding rates are stored without duplicate confirmations.
+- Automatic WebSocket reconnect is implemented.
+- Live confirmation has been verified for `COTIUSDT`, `DEXEUSDT`, `ERAUSDT`, and `ESPORTSUSDT`.
+- `confirmation_failed` was `0` in the verified live run.
+- `ruff`, `mypy`, and `pytest` pass for the current implementation.
+
+### Architecture
+
+The project uses Python, `asyncio`, `httpx`, `websockets`, `asyncpg`, and Supabase PostgreSQL.
+
+It does not use SQLAlchemy, Docker, FastAPI, private Binance endpoints, API keys, or trading orders.
+
+### Strategy Rules
+
+1. The system must work with both positive and negative funding.
+2. The minimum absolute gross funding threshold is `0.03%`, represented as `Decimal("0.0003")` in Binance API values.
+3. The first candidate threshold is `abs(funding_rate) >= Decimal("0.0003")`.
+4. Positive funding direction means short perpetual plus long spot. Negative funding direction means long perpetual plus short spot or borrowed spot asset.
+5. Raw data continues to be collected for all active symbols.
+6. Symbols below the threshold are not removed from historical collection. They are only excluded from later expensive analytics and signal workflows.
+7. A high current funding value is not a signal by itself.
+8. Later analytics must consider time to funding, persistence above threshold, funding direction, sign changes, late spikes, funding drops before payment, funding velocity, funding acceleration, mark/index premium, price movement, volatility, liquidity, spread, depth, slippage, spot hedge availability, borrow availability and cost, fees, funding interval, caps/floors, expected net edge, and historical symbol reliability.
+9. The first mode is observation-only. The project must not place orders or perform real trading.
+
+### Roadmap
+
+- Stage 1: collector and confirmation - completed.
+- Stage 2: analytical data foundation.
+- Stage 3: funding history engine.
+- Stage 4: candidate detection.
+- Stage 5: time-window logic.
+- Stage 6: stability engine.
+- Stage 7: market risk and liquidity.
+- Stage 8: net edge.
+- Stage 9: scoring.
+- Stage 10: symbol reliability.
+- Stage 11: observation mode.
+- Stage 12: notifications/UI/paper trading.
+
 ## Requirements
 
 Python 3.12, public internet access to Binance endpoints, and a Supabase PostgreSQL connection string.
@@ -22,6 +77,16 @@ python -m pip install -e ".[dev]"
 
 Create `.env` from `.env.example` and set `DATABASE_URL`. Do not commit `.env`.
 
+Optional analytics settings:
+
+```text
+ABS_MIN_FUNDING_RATE=0.0003
+DEFAULT_FUNDING_INTERVAL_HOURS=8
+ANALYTICS_OBSERVATION_ONLY=true
+```
+
+`ABS_MIN_FUNDING_RATE` is used for status and aggregate reporting. It does not stop snapshots below the threshold from being saved.
+
 In Supabase, get the PostgreSQL connection string from Project Settings, Database, Connection string. For local development, use the Session Pooler connection string when available.
 
 ```powershell
@@ -37,6 +102,8 @@ python -m funding_monitor check-db
 python -m funding_monitor sync-symbols
 python -m funding_monitor collect
 python -m funding_monitor status
+python -m funding_monitor snapshot-stats
+python -m funding_monitor snapshot-stats --minutes 60
 python -m funding_monitor recent-events --limit 20
 python -m funding_monitor export-csv --output data/funding_events.csv
 ```
@@ -49,7 +116,7 @@ python -m funding_monitor export-csv --output data/funding_events.csv
 
 `symbols` stores active USDT perpetual contract metadata and the funding interval in hours.
 
-`funding_snapshots` stores WebSocket mark price snapshots. Decimal values are PostgreSQL `NUMERIC` values and timestamps are UTC `TIMESTAMPTZ` values.
+`funding_snapshots` stores WebSocket mark price snapshots. Decimal values are PostgreSQL `NUMERIC` values and timestamps are UTC `TIMESTAMPTZ` values. Snapshot analytics include `funding_rate`, `seconds_to_funding`, `premium_rate`, `funding_direction`, and `funding_interval_hours`.
 
 `funding_events` stores one row per symbol and funding time, including checkpoint predictions, actual funding rate, prediction error, confirmation status, and the next predicted rate seen after funding.
 

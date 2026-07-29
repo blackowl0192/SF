@@ -4,17 +4,18 @@ from .binance_rest import BinanceRestClient
 from .models import SymbolRecord, utc_now
 from .repository import FundingRepository
 
-DEFAULT_FUNDING_INTERVAL_HOURS = 8
-
 
 class SymbolService:
     def __init__(
         self,
         repository: FundingRepository,
         rest_client: BinanceRestClient,
+        *,
+        default_funding_interval_hours: int = 8,
     ) -> None:
         self.repository = repository
         self.rest_client = rest_client
+        self.default_funding_interval_hours = default_funding_interval_hours
 
     async def sync_symbols(self) -> int:
         exchange_info = await self.rest_client.get_exchange_info()
@@ -43,7 +44,7 @@ class SymbolService:
                     contract_type=item["contractType"],
                     status=item["status"],
                     funding_interval_hours=interval_overrides.get(
-                        symbol, DEFAULT_FUNDING_INTERVAL_HOURS
+                        symbol, self.default_funding_interval_hours
                     ),
                     is_active=True,
                     created_at=now,

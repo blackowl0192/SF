@@ -58,7 +58,11 @@ class FundingCollector:
         max_messages: int | None = None,
         max_seconds: float | None = None,
     ) -> int:
-        symbol_service = SymbolService(self.repository, self.rest_client)
+        symbol_service = SymbolService(
+            self.repository,
+            self.rest_client,
+            default_funding_interval_hours=self.settings.default_funding_interval_hours,
+        )
         await symbol_service.sync_symbols()
         active_symbols = await self.repository.active_symbols()
         logger.info("loaded %s active symbols", len(active_symbols))
@@ -97,7 +101,11 @@ class FundingCollector:
                 if not self.throttler.should_save(update.symbol, update.event_time, mode):
                     continue
 
-                snapshot = snapshot_from_update(update, capture_mode=mode)
+                snapshot = snapshot_from_update(
+                    update,
+                    capture_mode=mode,
+                    funding_interval_hours=symbol_record.funding_interval_hours,
+                )
                 inserted = await self.repository.insert_snapshot(snapshot)
                 if inserted:
                     await self.event_service.observe_snapshot(

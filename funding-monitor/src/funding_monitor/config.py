@@ -1,3 +1,4 @@
+from decimal import Decimal
 from pathlib import Path
 
 from pydantic import Field, ValidationError
@@ -11,6 +12,9 @@ class Settings(BaseSettings):
     database_pool_min_size: int = 1
     database_pool_max_size: int = 10
     database_command_timeout_seconds: float = 30
+    abs_min_funding_rate: Decimal = Decimal("0.0003")
+    default_funding_interval_hours: int = 8
+    analytics_observation_only: bool = True
     log_level: str = "INFO"
     normal_snapshot_interval_seconds: int = 60
     funding_window_before_seconds: int = 600

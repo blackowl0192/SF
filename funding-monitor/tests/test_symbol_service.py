@@ -29,6 +29,13 @@ class FakeRestClient:
                     "status": "TRADING",
                 },
                 {
+                    "symbol": "ETHUSDT",
+                    "baseAsset": "ETH",
+                    "quoteAsset": "USDT",
+                    "contractType": "PERPETUAL",
+                    "status": "TRADING",
+                },
+                {
                     "symbol": "ETHUSDC",
                     "baseAsset": "ETH",
                     "quoteAsset": "USDC",
@@ -54,11 +61,12 @@ def test_symbol_sync_filters_and_applies_funding_interval() -> None:
         repository = FakeRepository()
         service = SymbolService(repository, FakeRestClient())  # type: ignore[arg-type]
 
-        assert await service.sync_symbols() == 1
-        assert await service.sync_symbols() == 1
+        assert await service.sync_symbols() == 2
+        assert await service.sync_symbols() == 2
         symbols = await repository.active_symbols()
 
-        assert list(symbols) == ["BTCUSDT"]
+        assert list(symbols) == ["BTCUSDT", "ETHUSDT"]
         assert symbols["BTCUSDT"].funding_interval_hours == 4
+        assert symbols["ETHUSDT"].funding_interval_hours == 8
 
     asyncio.run(scenario())
