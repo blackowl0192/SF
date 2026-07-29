@@ -8,6 +8,7 @@ from .binance_rest import BinanceRestClient
 from .collector import run_collector
 from .config import Settings, load_settings
 from .database import PostgresDatabase
+from .history_service import FundingHistoryService, FundingMetrics, WindowCacheSummary
 from .logging_config import configure_logging
 from .models import (
     FundingEvent,
@@ -100,6 +101,24 @@ async def _run(args: argparse.Namespace, settings: Settings) -> None:
         _print_snapshot_stats(stats)
         return
 
+    if args.command == "history":
+        async with database:
+            repository = FundingRepository(database)
+            history = _create_history_service(repository, settings)
+            await history.reload()
+            history_summary = history.summary()
+        _print_history_summary(history_summary)
+        return
+
+    if args.command == "metrics":
+        async with database:
+            repository = FundingRepository(database)
+            history = _create_history_service(repository, settings)
+            await history.reload()
+            metrics = history.get_metrics(args.symbol, args.window_minutes)
+        _print_metrics(metrics)
+        return
+
     if args.command == "recent-events":
         async with database:
             repository = FundingRepository(database)
@@ -155,6 +174,12 @@ def _build_parser() -> argparse.ArgumentParser:
     stats_parser = subparsers.add_parser("snapshot-stats")
     stats_parser.add_argument("--minutes", type=int, default=None)
 
+    subparsers.add_parser("history")
+
+    metrics_parser = subparsers.add_parser("metrics")
+    metrics_parser.add_argument("symbol")
+    metrics_parser.add_argument("--window-minutes", type=int, default=None)
+
     recent_parser = subparsers.add_parser("recent-events")
     recent_parser.add_argument("--limit", type=int, default=20)
 
@@ -162,6 +187,45 @@ def _build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--output", type=Path, required=True)
 
     return parser
+
+
+def _create_history_service(
+    repository: FundingRepository, settings: Settings
+) -> FundingHistoryService:
+    return FundingHistoryService(
+        repository=repository,
+        window_cache_minutes=settings.window_cache_minutes,
+        default_metrics_window=settings.default_metrics_window,
+        abs_threshold=settings.abs_min_funding_rate,
+    )
+
+
+def _print_history_summary(summary: WindowCacheSummary) -> None:
+    print(f"symbols_cached: {summary.symbols_cached}")
+    print(f"snapshots_in_cache: {summary.snapshots_in_cache}")
+    print(f"cache_memory_estimate_bytes: {summary.cache_memory_estimate_bytes}")
+    print(f"window_size_minutes: {summary.window_size_minutes}")
+    print(f"cache_oldest: {summary.cache_oldest or ''}")
+    print(f"cache_newest: {summary.cache_newest or ''}")
+
+
+def _print_metrics(metrics: FundingMetrics) -> None:
+    print(f"current: {_optional_text(metrics.current_rate)}")
+    print(f"mean: {_optional_text(metrics.mean_rate)}")
+    print(f"median: {_optional_text(metrics.median_rate)}")
+    print(f"min: {_optional_text(metrics.min_rate)}")
+    print(f"max: {_optional_text(metrics.max_rate)}")
+    print(f"std: {_optional_text(metrics.std_rate)}")
+    print(f"threshold_persistence: {metrics.threshold_persistence}")
+    print(f"direction: {_optional_text(metrics.current_direction)}")
+    print(f"direction_changes: {metrics.direction_changes}")
+    print(f"velocity: {_optional_text(metrics.rate_velocity)}")
+    print(f"acceleration: {_optional_text(metrics.rate_acceleration)}")
+    print(f"snapshot_count: {metrics.snapshot_count}")
+
+
+def _optional_text(value: object | None) -> str:
+    return "" if value is None else str(value)
 
 
 def _print_snapshot_stats(stats: dict[str, object]) -> None:

@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     abs_min_funding_rate: Decimal = Decimal("0.0003")
     default_funding_interval_hours: int = 8
     analytics_observation_only: bool = True
+    window_cache_minutes: int = 120
+    default_metrics_window: int = 60
     log_level: str = "INFO"
     normal_snapshot_interval_seconds: int = 60
     funding_window_before_seconds: int = 600

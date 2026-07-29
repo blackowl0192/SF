@@ -139,6 +139,19 @@ def test_snapshot_stats_returns_aggregates_with_optional_time_window() -> None:
     assert stats["average_absolute_funding_rate"] == Decimal("0.00025")
 
 
+def test_recent_snapshots_loads_window_from_postgresql() -> None:
+    connection = RecentSnapshotsConnection()
+    repository = FundingRepository(RecordingDatabase(connection))  # type: ignore[arg-type]
+
+    snapshots = asyncio.run(repository.recent_snapshots(120))
+
+    assert connection.args == (120,)
+    assert "make_interval" in connection.sql
+    assert len(snapshots) == 1
+    assert snapshots[0].symbol == "BTCUSDT"
+    assert snapshots[0].funding_rate == Decimal("0.0004")
+
+
 def test_snapshots_below_threshold_continue_saving() -> None:
     connection = RecordingConnection()
     repository = FundingRepository(RecordingDatabase(connection))  # type: ignore[arg-type]
@@ -259,6 +272,37 @@ class SnapshotStatsConnection:
             "newest_snapshot": datetime(2024, 1, 1, 7, 59, tzinfo=UTC),
             "oldest_snapshot": datetime(2024, 1, 1, 7, 1, tzinfo=UTC),
         }
+
+
+class RecentSnapshotsConnection:
+    def __init__(self) -> None:
+        self.sql = ""
+        self.args = ()
+
+    async def fetch(self, sql, *args):
+        self.sql = sql
+        self.args = args
+        event_time = datetime(2024, 1, 1, 8, tzinfo=UTC)
+        return [
+            {
+                "symbol": "BTCUSDT",
+                "event_time": event_time,
+                "received_at": event_time,
+                "mark_price": Decimal("101.0"),
+                "index_price": Decimal("100.0"),
+                "estimated_settle_price": None,
+                "predicted_funding_rate": Decimal("0.0004"),
+                "funding_rate": Decimal("0.0004"),
+                "interest_rate": None,
+                "next_funding_time": event_time + timedelta(hours=1),
+                "seconds_until_funding": 3600,
+                "seconds_to_funding": 3600,
+                "premium_rate": Decimal("0.01"),
+                "funding_direction": "positive",
+                "funding_interval_hours": 8,
+                "capture_mode": "normal",
+            }
+        ]
 
 
 class RecordingDatabase:

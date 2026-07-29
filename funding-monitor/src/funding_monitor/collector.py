@@ -14,6 +14,7 @@ from .funding_event_service import (
     FundingConfirmationScheduler,
     FundingEventService,
 )
+from .history_service import FundingHistoryService
 from .repository import FundingRepository
 from .snapshot_service import (
     SnapshotThrottler,
@@ -50,6 +51,12 @@ class FundingCollector:
             retry_seconds=settings.confirmation_retry_seconds,
             max_attempts=settings.confirmation_max_attempts,
         )
+        self.history_service = FundingHistoryService(
+            repository=repository,
+            window_cache_minutes=settings.window_cache_minutes,
+            default_metrics_window=settings.default_metrics_window,
+            abs_threshold=settings.abs_min_funding_rate,
+        )
         self._last_next_funding_by_symbol: dict[str, datetime] = {}
 
     async def run(
@@ -65,6 +72,7 @@ class FundingCollector:
         )
         await symbol_service.sync_symbols()
         active_symbols = await self.repository.active_symbols()
+        await self.history_service.reload()
         logger.info("loaded %s active symbols", len(active_symbols))
 
         stop_event = asyncio.Event()
@@ -108,6 +116,7 @@ class FundingCollector:
                 )
                 inserted = await self.repository.insert_snapshot(snapshot)
                 if inserted:
+                    self.history_service.update(snapshot)
                     await self.event_service.observe_snapshot(
                         snapshot,
                         funding_interval_hours=symbol_record.funding_interval_hours,

@@ -253,6 +253,19 @@ class FundingRepository:
             )
         return [self._row_to_snapshot(row) for row in rows]
 
+    async def recent_snapshots(self, minutes: int) -> list[FundingSnapshot]:
+        async with self.database.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT *
+                FROM funding_snapshots
+                WHERE received_at >= NOW() - make_interval(mins => $1::int)
+                ORDER BY symbol, event_time
+                """,
+                minutes,
+            )
+        return [self._row_to_snapshot(row) for row in rows]
+
     async def mark_event_confirmed(
         self,
         symbol: str,

@@ -21,3 +21,5 @@ def test_analytics_defaults_use_decimal_and_observation_mode(monkeypatch) -> Non
     assert settings.abs_min_funding_rate == Decimal("0.0003")
     assert settings.default_funding_interval_hours == 8
     assert settings.analytics_observation_only is True
+    assert settings.window_cache_minutes == 120
+    assert settings.default_metrics_window == 60
