@@ -12,7 +12,7 @@ from websockets.exceptions import WebSocketException
 
 from .models import MarkPriceUpdate, parse_mark_price_payload
 
-BINANCE_WS_URL = "wss://fstream.binance.com/ws/!markPrice@arr@1s"
+BINANCE_WS_URL = "wss://fstream.binance.com/market/ws/!markPrice@arr@1s"
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,8 @@ class BinanceWebSocketClient:
                         except TimeoutError:
                             continue
                         for update in self._parse_message(message):
+                            if stop_event.is_set():
+                                break
                             yield update
             except asyncio.CancelledError:
                 raise

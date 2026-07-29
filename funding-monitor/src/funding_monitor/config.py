@@ -1,10 +1,16 @@
 from pathlib import Path
 
+from pydantic import Field, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
-    database_path: Path = Path("data/funding_monitor.db")
+    database_url: str = Field(min_length=1)
+    database_pool_min_size: int = 1
+    database_pool_max_size: int = 10
+    database_command_timeout_seconds: float = 30
     log_level: str = "INFO"
     normal_snapshot_interval_seconds: int = 60
     funding_window_before_seconds: int = 600
@@ -17,7 +23,17 @@ class Settings(BaseSettings):
     ws_max_reconnect_delay_seconds: int = 60
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+
+def load_settings() -> Settings:
+    try:
+        return Settings()  # type: ignore[call-arg]
+    except ValidationError as exc:
+        raise RuntimeError(
+            "DATABASE_URL is required. Create .env from .env.example and set a "
+            "Supabase PostgreSQL connection string."
+        ) from exc

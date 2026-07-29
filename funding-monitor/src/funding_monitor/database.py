@@ -1,75 +1,171 @@
 from __future__ import annotations
 
+import logging
+import ssl
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, Self
+from urllib.parse import parse_qs, urlsplit
 
-import aiosqlite
+import asyncpg
 
-SCHEMA_SQL = """
-PRAGMA journal_mode = WAL;
+from .config import PROJECT_ROOT, Settings
 
-CREATE TABLE IF NOT EXISTS symbols (
-    symbol TEXT PRIMARY KEY,
-    base_asset TEXT NOT NULL,
-    quote_asset TEXT NOT NULL,
-    contract_type TEXT NOT NULL,
-    status TEXT NOT NULL,
-    funding_interval_hours INTEGER NOT NULL DEFAULT 8,
-    is_active INTEGER NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
+logger = logging.getLogger(__name__)
 
-CREATE TABLE IF NOT EXISTS funding_snapshots (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol TEXT NOT NULL,
-    event_time TEXT NOT NULL,
-    received_at TEXT NOT NULL,
-    mark_price TEXT NOT NULL,
-    index_price TEXT,
-    estimated_settle_price TEXT,
-    predicted_funding_rate TEXT NOT NULL,
-    interest_rate TEXT,
-    next_funding_time TEXT NOT NULL,
-    seconds_until_funding INTEGER NOT NULL,
-    capture_mode TEXT NOT NULL,
-    UNIQUE(symbol, event_time, capture_mode)
-);
+DEFAULT_MIGRATIONS_PATH = PROJECT_ROOT / "migrations"
 
-CREATE TABLE IF NOT EXISTS funding_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol TEXT NOT NULL,
-    funding_time TEXT NOT NULL,
-    funding_interval_hours INTEGER NOT NULL,
-    first_predicted_rate TEXT,
-    predicted_rate_10m_before TEXT,
-    predicted_rate_5m_before TEXT,
-    predicted_rate_1m_before TEXT,
-    last_predicted_rate TEXT,
-    actual_funding_rate TEXT,
-    prediction_error TEXT,
-    mark_price_at_funding TEXT,
-    next_predicted_rate TEXT,
-    confirmed_at TEXT,
-    status TEXT NOT NULL DEFAULT 'waiting',
-    UNIQUE(symbol, funding_time)
-);
-
-CREATE INDEX IF NOT EXISTS idx_funding_snapshots_symbol_event_time
-ON funding_snapshots(symbol, event_time);
-
-CREATE INDEX IF NOT EXISTS idx_funding_snapshots_next_funding_time
-ON funding_snapshots(next_funding_time);
-
-CREATE INDEX IF NOT EXISTS idx_funding_events_symbol_funding_time
-ON funding_events(symbol, funding_time);
-
-CREATE INDEX IF NOT EXISTS idx_funding_events_status_funding_time
-ON funding_events(status, funding_time);
+CREATE_MIGRATIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
 """
 
 
-async def initialize_database(database_path: Path) -> None:
-    database_path.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(database_path) as db:
-        await db.executescript(SCHEMA_SQL)
-        await db.commit()
+@dataclass(frozen=True)
+class DatabaseCheckResult:
+    connected: bool
+    postgres_version: str
+    database_utc_time: datetime
+    applied_migrations: int
+
+
+class DatabaseConnectionError(RuntimeError):
+    pass
+
+
+class PostgresDatabase:
+    def __init__(
+        self,
+        *,
+        database_url: str,
+        min_size: int = 1,
+        max_size: int = 10,
+        command_timeout_seconds: float = 30,
+        migrations_path: Path = DEFAULT_MIGRATIONS_PATH,
+    ) -> None:
+        self.database_url = database_url
+        self.min_size = min_size
+        self.max_size = max_size
+        self.command_timeout_seconds = command_timeout_seconds
+        self.migrations_path = migrations_path
+        self._pool: Any | None = None
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> PostgresDatabase:
+        return cls(
+            database_url=settings.database_url,
+            min_size=settings.database_pool_min_size,
+            max_size=settings.database_pool_max_size,
+            command_timeout_seconds=settings.database_command_timeout_seconds,
+        )
+
+    async def __aenter__(self) -> Self:
+        await self.open()
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        await self.close()
+
+    async def open(self) -> None:
+        if self._pool is not None:
+            return
+        try:
+            self._pool = await asyncpg.create_pool(
+                dsn=self.database_url,
+                min_size=self.min_size,
+                max_size=self.max_size,
+                command_timeout=self.command_timeout_seconds,
+                ssl=_ssl_from_database_url(self.database_url),
+            )
+        except (OSError, asyncpg.PostgresError) as exc:
+            raise DatabaseConnectionError(
+                "Could not connect to PostgreSQL. Verify DATABASE_URL, SSL "
+                "settings, network access, and Supabase pooler availability."
+            ) from exc
+
+    async def close(self) -> None:
+        if self._pool is None:
+            return
+        await self._pool.close()
+        self._pool = None
+
+    @asynccontextmanager
+    async def acquire(self) -> AsyncIterator[Any]:
+        if self._pool is None:
+            raise RuntimeError("PostgreSQL pool is not open")
+        async with self._pool.acquire() as connection:
+            yield connection
+
+    async def check_connection(self) -> DatabaseCheckResult:
+        async with self.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT version() AS version, NOW() AT TIME ZONE 'UTC' AS utc_now"
+            )
+            applied_migrations = await applied_migrations_count(connection)
+        utc_time = _attach_utc(row["utc_now"])
+        return DatabaseCheckResult(
+            connected=True,
+            postgres_version=row["version"],
+            database_utc_time=utc_time,
+            applied_migrations=applied_migrations,
+        )
+
+    async def migrate(self) -> list[str]:
+        async with self.acquire() as connection:
+            return await run_migrations(connection, self.migrations_path)
+
+
+async def run_migrations(connection: Any, migrations_path: Path) -> list[str]:
+    await connection.execute(CREATE_MIGRATIONS_TABLE_SQL)
+    applied = {
+        row["version"]
+        for row in await connection.fetch(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        )
+    }
+    applied_now: list[str] = []
+
+    for migration_file in sorted(migrations_path.glob("*.sql")):
+        version = migration_file.name
+        if version in applied:
+            continue
+        sql = migration_file.read_text(encoding="utf-8")
+        async with connection.transaction():
+            await connection.execute(sql)
+            await connection.execute(
+                "INSERT INTO schema_migrations(version) VALUES ($1)",
+                version,
+            )
+        applied_now.append(version)
+        logger.info("applied migration %s", version)
+
+    return applied_now
+
+
+async def applied_migrations_count(connection: Any) -> int:
+    try:
+        count = await connection.fetchval("SELECT COUNT(*) FROM schema_migrations")
+    except asyncpg.UndefinedTableError:
+        return 0
+    return int(count or 0)
+
+
+def _ssl_from_database_url(database_url: str) -> Any | None:
+    query = parse_qs(urlsplit(database_url).query)
+    sslmode = query.get("sslmode", ["require"])[0].lower()
+    if sslmode == "disable":
+        return None
+    if sslmode in {"verify-ca", "verify-full"}:
+        return ssl.create_default_context()
+    return "require"
+
+
+def _attach_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)

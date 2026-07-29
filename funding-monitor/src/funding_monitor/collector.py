@@ -8,7 +8,7 @@ from datetime import datetime
 from .binance_rest import BinanceRestClient
 from .binance_ws import BinanceWebSocketClient
 from .config import Settings
-from .database import initialize_database
+from .database import PostgresDatabase
 from .funding_event_service import (
     ConfirmationRequest,
     FundingConfirmationScheduler,
@@ -58,7 +58,6 @@ class FundingCollector:
         max_messages: int | None = None,
         max_seconds: float | None = None,
     ) -> int:
-        await initialize_database(self.settings.database_path)
         symbol_service = SymbolService(self.repository, self.rest_client)
         await symbol_service.sync_symbols()
         active_symbols = await self.repository.active_symbols()
@@ -128,20 +127,24 @@ async def run_collector(
     max_messages: int | None = None,
     max_seconds: float | None = None,
 ) -> int:
-    repository = FundingRepository(settings.database_path)
-    async with BinanceRestClient(
-        timeout_seconds=settings.rest_timeout_seconds
-    ) as rest_client:
-        ws_client = BinanceWebSocketClient(
-            max_reconnect_delay_seconds=settings.ws_max_reconnect_delay_seconds
-        )
-        collector = FundingCollector(
-            settings=settings,
-            repository=repository,
-            rest_client=rest_client,
-            ws_client=ws_client,
-        )
-        return await collector.run(max_messages=max_messages, max_seconds=max_seconds)
+    database = PostgresDatabase.from_settings(settings)
+    async with database:
+        repository = FundingRepository(database)
+        async with BinanceRestClient(
+            timeout_seconds=settings.rest_timeout_seconds
+        ) as rest_client:
+            ws_client = BinanceWebSocketClient(
+                max_reconnect_delay_seconds=settings.ws_max_reconnect_delay_seconds
+            )
+            collector = FundingCollector(
+                settings=settings,
+                repository=repository,
+                rest_client=rest_client,
+                ws_client=ws_client,
+            )
+            return await collector.run(
+                max_messages=max_messages, max_seconds=max_seconds
+            )
 
 
 def _install_signal_handlers(stop_event: asyncio.Event) -> None:

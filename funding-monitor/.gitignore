@@ -13,3 +13,5 @@ logs/
 data/*.csv
 data/*-tmp.csv
 data/*.tmp.csv
+
+.tmp/

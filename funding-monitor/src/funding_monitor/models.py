@@ -31,23 +31,27 @@ def datetime_to_text(value: datetime) -> str:
     return ensure_utc(value).isoformat(timespec="milliseconds")
 
 
-def text_to_datetime(value: str) -> datetime:
+def text_to_datetime(value: str | datetime) -> datetime:
+    if isinstance(value, datetime):
+        return ensure_utc(value)
     parsed = datetime.fromisoformat(value)
     return ensure_utc(parsed)
 
 
-def decimal_from_text(value: str | float | Decimal) -> Decimal:
+def decimal_from_text(value: object) -> Decimal:
     if isinstance(value, Decimal):
         return value
     if isinstance(value, float):
         raise TypeError("float values are not accepted for Decimal conversion")
+    if not isinstance(value, str | int):
+        raise TypeError(f"unsupported Decimal value type: {type(value).__name__}")
     try:
         return Decimal(str(value))
     except (InvalidOperation, ValueError) as exc:
         raise ValueError(f"invalid Decimal value: {value!r}") from exc
 
 
-def decimal_to_text(value: str | float | Decimal) -> str:
+def decimal_to_text(value: object) -> str:
     return format(decimal_from_text(value), "f")
 
 

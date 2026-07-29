@@ -1,8 +1,20 @@
 import asyncio
 
-from funding_monitor.database import initialize_database
-from funding_monitor.repository import FundingRepository
+from funding_monitor.models import SymbolRecord
 from funding_monitor.symbol_service import SymbolService
+
+
+class FakeRepository:
+    def __init__(self) -> None:
+        self.symbols: dict[str, SymbolRecord] = {}
+
+    async def upsert_symbols(self, symbols):
+        rows = list(symbols)
+        self.symbols.update({row.symbol: row for row in rows})
+        return len(rows)
+
+    async def active_symbols(self):
+        return self.symbols
 
 
 class FakeRestClient:
@@ -37,15 +49,9 @@ class FakeRestClient:
         return [{"symbol": "BTCUSDT", "fundingIntervalHours": 4}]
 
 
-def run(coro):
-    return asyncio.run(coro)
-
-
-def test_symbol_sync_filters_and_applies_funding_interval(tmp_path) -> None:
+def test_symbol_sync_filters_and_applies_funding_interval() -> None:
     async def scenario() -> None:
-        database_path = tmp_path / "funding.db"
-        await initialize_database(database_path)
-        repository = FundingRepository(database_path)
+        repository = FakeRepository()
         service = SymbolService(repository, FakeRestClient())  # type: ignore[arg-type]
 
         assert await service.sync_symbols() == 1
@@ -55,4 +61,4 @@ def test_symbol_sync_filters_and_applies_funding_interval(tmp_path) -> None:
         assert list(symbols) == ["BTCUSDT"]
         assert symbols["BTCUSDT"].funding_interval_hours == 4
 
-    run(scenario())
+    asyncio.run(scenario())
