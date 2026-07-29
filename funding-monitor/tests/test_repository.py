@@ -29,6 +29,10 @@ def test_repository_uses_postgresql_placeholders() -> None:
     assert "$1" in sql
 
 
+def test_snapshot_insert_does_not_depend_on_instrument_mappings() -> None:
+    assert "instrument_mappings" not in INSERT_SNAPSHOT_SQL
+
+
 def test_on_conflict_keeps_old_semantics() -> None:
     assert "ON CONFLICT(symbol, event_time, capture_mode) DO NOTHING" in (
         INSERT_SNAPSHOT_SQL

@@ -23,3 +23,6 @@ def test_analytics_defaults_use_decimal_and_observation_mode(monkeypatch) -> Non
     assert settings.analytics_observation_only is True
     assert settings.window_cache_minutes == 120
     assert settings.default_metrics_window == 60
+    assert settings.binance_spot_base_url == "https://api.binance.com"
+    assert settings.supported_spot_quote_asset == "USDT"
+    assert settings.instrument_mapping_sync_on_startup is False

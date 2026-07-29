@@ -7,6 +7,7 @@ from typing import Any, Self
 import httpx
 
 BINANCE_REST_BASE_URL = "https://fapi.binance.com"
+BINANCE_SPOT_BASE_URL = "https://api.binance.com"
 
 logger = logging.getLogger(__name__)
 
@@ -124,3 +125,23 @@ class BinanceRestClient:
             status = exc.response.status_code
             return status in (429, 418) or 500 <= status < 600
         return False
+
+
+class BinanceSpotRestClient(BinanceRestClient):
+    def __init__(
+        self,
+        *,
+        base_url: str = BINANCE_SPOT_BASE_URL,
+        timeout_seconds: float = 10,
+        max_attempts: int = 3,
+        initial_backoff_seconds: float = 0.5,
+    ) -> None:
+        super().__init__(
+            base_url=base_url,
+            timeout_seconds=timeout_seconds,
+            max_attempts=max_attempts,
+            initial_backoff_seconds=initial_backoff_seconds,
+        )
+
+    async def get_exchange_info(self) -> dict[str, Any]:
+        return await self._get("/api/v3/exchangeInfo")

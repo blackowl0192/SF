@@ -24,6 +24,7 @@
 - Automatic WebSocket reconnect is implemented.
 - Funding History Engine maintains an in-memory per-symbol snapshot window loaded from PostgreSQL.
 - `history` and `metrics` commands expose cache and per-symbol window metrics.
+- Spot to Futures Instrument Mapping stores metadata-only execution eligibility for supported USDT instruments.
 - Live confirmation has been verified for `COTIUSDT`, `DEXEUSDT`, `ERAUSDT`, and `ESPORTSUSDT`.
 - `confirmation_failed` was `0` in the verified live run.
 - `ruff`, `mypy`, and `pytest` pass for the current implementation.
@@ -50,17 +51,18 @@ It does not use SQLAlchemy, Docker, FastAPI, private Binance endpoints, API keys
 
 - Stage 1: collector and confirmation - completed.
 - Stage 2: analytical data foundation - completed.
-- Stage 2.2: funding history engine.
+- Stage 2.2: Funding History Engine - completed.
+- Stage 2.3: Instrument Mapping - completed.
+- Stage 2.4: Margin Borrow Availability or Candidate Detection, depending on the approved plan.
 - Stage 3: candidate detection.
-- Stage 4: candidate detection.
-- Stage 5: time-window logic.
-- Stage 6: stability engine.
-- Stage 7: market risk and liquidity.
-- Stage 8: net edge.
-- Stage 9: scoring.
-- Stage 10: symbol reliability.
-- Stage 11: observation mode.
-- Stage 12: notifications/UI/paper trading.
+- Stage 4: time-window logic.
+- Stage 5: stability engine.
+- Stage 6: market risk and liquidity.
+- Stage 7: net edge.
+- Stage 8: scoring.
+- Stage 9: symbol reliability.
+- Stage 10: observation mode.
+- Stage 11: notifications/UI/paper trading.
 
 ## Requirements
 
@@ -88,11 +90,16 @@ DEFAULT_FUNDING_INTERVAL_HOURS=8
 ANALYTICS_OBSERVATION_ONLY=true
 WINDOW_CACHE_MINUTES=120
 DEFAULT_METRICS_WINDOW=60
+BINANCE_SPOT_BASE_URL=https://api.binance.com
+SUPPORTED_SPOT_QUOTE_ASSET=USDT
+INSTRUMENT_MAPPING_SYNC_ON_STARTUP=false
 ```
 
 `ABS_MIN_FUNDING_RATE` is used for status and aggregate reporting. It does not stop snapshots below the threshold from being saved.
 
 `WINDOW_CACHE_MINUTES` controls the in-memory per-symbol history cache. `DEFAULT_METRICS_WINDOW` controls the default window used by the `metrics` command.
+
+`BINANCE_SPOT_BASE_URL` is used only for public Spot `exchangeInfo`. `SUPPORTED_SPOT_QUOTE_ASSET` is currently `USDT`. `INSTRUMENT_MAPPING_SYNC_ON_STARTUP` is present for future startup integration and defaults to `false`.
 
 In Supabase, get the PostgreSQL connection string from Project Settings, Database, Connection string. For local development, use the Session Pooler connection string when available.
 
@@ -114,6 +121,11 @@ python -m funding_monitor snapshot-stats --minutes 60
 python -m funding_monitor history
 python -m funding_monitor metrics BTCUSDT
 python -m funding_monitor metrics BTCUSDT --window-minutes 15
+python -m funding_monitor sync-instrument-mappings
+python -m funding_monitor instrument-mappings
+python -m funding_monitor instrument-mappings --status matched
+python -m funding_monitor instrument-mappings --status ambiguous
+python -m funding_monitor instrument-mappings --symbol BTCUSDT
 python -m funding_monitor recent-events --limit 20
 python -m funding_monitor export-csv --output data/funding_events.csv
 ```
@@ -130,6 +142,8 @@ python -m funding_monitor export-csv --output data/funding_events.csv
 
 `funding_events` stores one row per symbol and funding time, including checkpoint predictions, actual funding rate, prediction error, confirmation status, and the next predicted rate seen after funding.
 
+`instrument_mappings` stores metadata-only Spot to Futures mapping status and strategy availability for futures symbols. It is not tied to current funding thresholds and does not create trading signals.
+
 ## Funding History Engine
 
 `FundingHistoryService` is the analytical history layer for later candidate detection, stability, scoring, and net edge stages. PostgreSQL remains the source of truth. On reload, the service loads the last `WINDOW_CACHE_MINUTES` minutes once, then new collector snapshots update the in-memory cache without a SQL query per snapshot.
@@ -138,7 +152,23 @@ python -m funding_monitor export-csv --output data/funding_events.csv
 
 `FundingMetrics` is calculated from snapshots for a single symbol and window. It includes current, min, max, mean, median, standard deviation, absolute mean, threshold persistence, threshold crossings, direction changes, deltas, velocity, acceleration, history duration, and snapshot count.
 
-This layer does not implement candidate detection, scoring, net edge, spot mapping, borrow checks, notifications, UI, or trading.
+This layer does not implement candidate detection, scoring, net edge, borrow checks, notifications, UI, or trading.
+
+## Instrument Mapping
+
+Instrument mapping checks whether a USD-M perpetual futures symbol has a safe, active USDT spot pair. PostgreSQL is the source of truth through the `instrument_mappings` table.
+
+Funding snapshots and history metrics continue to be stored for every active futures symbol even when no spot pair exists. Missing or ambiguous spot mapping affects execution eligibility only; it does not stop observation or historical analysis.
+
+Positive funding is theoretically executed as short perpetual plus long spot. `positive_strategy_available` is true only when the futures contract is a trading USDT perpetual margined in USDT and the matching spot pair is trading with spot trading allowed.
+
+Negative funding is theoretically executed as long perpetual plus short spot or borrowed spot asset. Margin borrow checks are not implemented yet, so `negative_strategy_available` remains false and matched instruments use `negative_strategy_status=borrow_check_not_implemented`.
+
+Mapping statuses are `matched`, `missing`, `ambiguous`, `unsupported`, and `spot_trading_disabled`.
+
+Multiplier contracts such as `1000PEPEUSDT` are marked `ambiguous`. They are not automatically mapped to `PEPEUSDT` because the quantity multiplier must be explicit before execution logic can be safe.
+
+The mapping layer does not implement Margin API, API keys, borrow availability, fees, order book data, scoring, candidate detection, paper trading, or real orders.
 
 ## Predicted Rate And Actual Rate
 

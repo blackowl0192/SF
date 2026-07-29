@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     analytics_observation_only: bool = True
     window_cache_minutes: int = 120
     default_metrics_window: int = 60
+    binance_spot_base_url: str = "https://api.binance.com"
+    supported_spot_quote_asset: str = "USDT"
+    instrument_mapping_sync_on_startup: bool = False
     log_level: str = "INFO"
     normal_snapshot_interval_seconds: int = 60
     funding_window_before_seconds: int = 600

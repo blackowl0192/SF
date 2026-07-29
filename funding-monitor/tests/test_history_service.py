@@ -170,6 +170,20 @@ def test_metrics_single_value() -> None:
     assert metrics.snapshot_count == 1
 
 
+def test_history_metrics_do_not_require_spot_mapping() -> None:
+    now = datetime(2024, 1, 1, 8, tzinfo=UTC)
+    metrics = calculate_funding_metrics(
+        [
+            make_snapshot("1000PEPEUSDT", now, "-0.0004"),
+            make_snapshot("1000PEPEUSDT", now + timedelta(minutes=1), "-0.0005"),
+        ],
+        abs_threshold=Decimal("0.0003"),
+    )
+
+    assert metrics.snapshot_count == 2
+    assert metrics.current_rate == Decimal("-0.0005")
+
+
 def make_snapshot(symbol: str, event_time: datetime, rate: str) -> FundingSnapshot:
     funding_rate = Decimal(rate)
     return FundingSnapshot(
