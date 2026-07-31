@@ -3,17 +3,103 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import Protocol
 
 from .models import (
     FundingSnapshot,
     MarkPriceUpdate,
     calculate_premium_rate,
     calculate_seconds_to_funding,
+    ensure_utc,
     funding_direction_from_rate,
     utc_now,
 )
 
 CaptureMode = str
+
+
+class SnapshotBatchRepository(Protocol):
+    async def insert_snapshots(
+        self,
+        snapshots: list[FundingSnapshot],
+    ) -> list[FundingSnapshot]:
+        ...
+
+
+@dataclass(frozen=True)
+class SnapshotPersistencePolicy:
+    normal_interval_seconds: int
+    detailed_interval_seconds: int
+
+    def __post_init__(self) -> None:
+        if self.normal_interval_seconds <= 0:
+            raise ValueError("normal_interval_seconds must be positive")
+        if self.detailed_interval_seconds <= 0:
+            raise ValueError("detailed_interval_seconds must be positive")
+
+
+@dataclass(frozen=True)
+class SnapshotBatchFlushResult:
+    attempted: int
+    inserted: tuple[FundingSnapshot, ...]
+    reason: str
+
+    @property
+    def inserted_count(self) -> int:
+        return len(self.inserted)
+
+
+class SnapshotBatchBuffer:
+    def __init__(
+        self,
+        *,
+        repository: SnapshotBatchRepository,
+        batch_size: int,
+        flush_interval_seconds: int,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if flush_interval_seconds <= 0:
+            raise ValueError("flush_interval_seconds must be positive")
+        self.repository = repository
+        self.batch_size = batch_size
+        self.flush_interval_seconds = flush_interval_seconds
+        self._pending: list[FundingSnapshot] = []
+        self._last_flush_at: datetime | None = None
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
+    def add(self, snapshot: FundingSnapshot) -> bool:
+        self._pending.append(snapshot)
+        return len(self._pending) >= self.batch_size
+
+    def should_flush(self, now: datetime) -> bool:
+        if not self._pending:
+            return False
+        if self._last_flush_at is None:
+            first_pending_at = min(item.received_at for item in self._pending)
+            return (
+                ensure_utc(now) - ensure_utc(first_pending_at)
+            ).total_seconds() >= self.flush_interval_seconds
+        return (
+            ensure_utc(now) - ensure_utc(self._last_flush_at)
+        ).total_seconds() >= self.flush_interval_seconds
+
+    async def flush(self, *, reason: str) -> SnapshotBatchFlushResult:
+        if not self._pending:
+            self._last_flush_at = utc_now()
+            return SnapshotBatchFlushResult(attempted=0, inserted=(), reason=reason)
+        rows = list(self._pending)
+        inserted = await self.repository.insert_snapshots(rows)
+        del self._pending[: len(rows)]
+        self._last_flush_at = utc_now()
+        return SnapshotBatchFlushResult(
+            attempted=len(rows),
+            inserted=tuple(inserted),
+            reason=reason,
+        )
 
 
 def determine_capture_mode(
@@ -38,17 +124,19 @@ class SnapshotThrottler:
         normal_interval_seconds: int,
         detailed_interval_seconds: int,
     ) -> None:
-        self.normal_interval_seconds = normal_interval_seconds
-        self.detailed_interval_seconds = detailed_interval_seconds
+        self.policy = SnapshotPersistencePolicy(
+            normal_interval_seconds=normal_interval_seconds,
+            detailed_interval_seconds=detailed_interval_seconds,
+        )
         self._last_saved: dict[tuple[str, str], datetime] = {}
 
     def should_save(
         self, symbol: str, event_time: datetime, capture_mode: CaptureMode
     ) -> bool:
         interval = (
-            self.normal_interval_seconds
+            self.policy.normal_interval_seconds
             if capture_mode == "normal"
-            else self.detailed_interval_seconds
+            else self.policy.detailed_interval_seconds
         )
         key = (symbol, capture_mode)
         previous = self._last_saved.get(key)

@@ -44,6 +44,21 @@ class Settings(BaseSettings):
     candidate_max_results: int = 50
     funding_interval_point_tolerance_seconds: int = 90
     funding_interval_summary_batch_size: int = 500
+    snapshot_persist_interval_seconds: int = Field(default=60, gt=0)
+    snapshot_batch_size: int = Field(default=500, gt=0)
+    snapshot_flush_interval_seconds: int = Field(default=5, gt=0)
+    collector_health_window_minutes: int = Field(default=5, gt=0)
+    collector_health_max_snapshot_age_seconds: int = Field(default=180, gt=0)
+    collector_health_min_coverage_ratio: Decimal = Field(
+        default=Decimal("0.80"),
+        ge=Decimal(0),
+        le=Decimal(1),
+    )
+    candidate_evaluation_interval_seconds: int = Field(default=60, gt=0)
+    interval_summary_build_interval_seconds: int = Field(default=300, gt=0)
+    confirmation_backfill_interval_seconds: int = Field(default=300, gt=0)
+    confirmation_backfill_batch_size: int = Field(default=100, gt=0)
+    confirmation_overdue_grace_minutes: int = Field(default=30, ge=0)
     log_level: str = "INFO"
     normal_snapshot_interval_seconds: int = 60
     funding_window_before_seconds: int = 600

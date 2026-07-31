@@ -258,6 +258,14 @@ class RecordingIntervalRepository:
     async def snapshots_for_interval(self, _symbol, _funding_time):
         return [snapshot(FUNDING_TIME - timedelta(minutes=5), Decimal("0.0007"))]
 
+    async def snapshots_for_intervals(self, events):
+        return {
+            (item.symbol, item.funding_time): [
+                snapshot(FUNDING_TIME - timedelta(minutes=5), Decimal("0.0007"))
+            ]
+            for item in events
+        }
+
     async def upsert_interval_summaries(self, summaries):
         rows = list(summaries)
         self.upserted = len(rows)

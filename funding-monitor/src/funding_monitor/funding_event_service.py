@@ -45,6 +45,12 @@ class FundingEventService:
             last_predicted_rate=checkpoints.last_predicted_rate,
         )
 
+    async def observe_snapshots(
+        self,
+        snapshots: list[FundingSnapshot],
+    ) -> int:
+        return await self.repository.observe_snapshots(snapshots)
+
     async def store_next_predicted_rate(
         self,
         *,
@@ -63,6 +69,52 @@ class ConfirmationRequest:
     funding_time: datetime
 
 
+class FundingConfirmationService:
+    def __init__(
+        self,
+        *,
+        repository: FundingRepository,
+        rest_client: BinanceRestClient,
+    ) -> None:
+        self.repository = repository
+        self.rest_client = rest_client
+
+    async def try_confirm(self, request: ConfirmationRequest) -> bool:
+        window_start = request.funding_time - timedelta(minutes=10)
+        window_end = request.funding_time + timedelta(minutes=10)
+        history = await self.rest_client.get_funding_rate_history(
+            request.symbol,
+            start_time_ms=utc_datetime_to_millis(window_start),
+            end_time_ms=utc_datetime_to_millis(window_end),
+            limit=100,
+        )
+
+        funding_time_ms = utc_datetime_to_millis(request.funding_time)
+        for item in history:
+            if int(item.get("fundingTime", -1)) != funding_time_ms:
+                continue
+            actual_rate = decimal_from_text(item["fundingRate"])
+            mark_price = (
+                decimal_from_text(item["markPrice"])
+                if item.get("markPrice") is not None
+                else None
+            )
+            await self.repository.mark_event_confirmed(
+                request.symbol,
+                request.funding_time,
+                actual_rate,
+                mark_price,
+                utc_now(),
+            )
+            logger.info(
+                "confirmed funding event %s %s",
+                request.symbol,
+                request.funding_time.isoformat(),
+            )
+            return True
+        return False
+
+
 class FundingConfirmationScheduler:
     def __init__(
         self,
@@ -78,6 +130,10 @@ class FundingConfirmationScheduler:
         self.initial_delay_seconds = initial_delay_seconds
         self.retry_seconds = retry_seconds
         self.max_attempts = max_attempts
+        self.service = FundingConfirmationService(
+            repository=repository,
+            rest_client=rest_client,
+        )
         self._queued: set[tuple[str, str]] = set()
         self._tasks: set[asyncio.Task[None]] = set()
 
@@ -129,36 +185,4 @@ class FundingConfirmationScheduler:
         )
 
     async def _try_confirm(self, request: ConfirmationRequest) -> bool:
-        window_start = request.funding_time - timedelta(minutes=10)
-        window_end = request.funding_time + timedelta(minutes=10)
-        history = await self.rest_client.get_funding_rate_history(
-            request.symbol,
-            start_time_ms=utc_datetime_to_millis(window_start),
-            end_time_ms=utc_datetime_to_millis(window_end),
-            limit=100,
-        )
-
-        funding_time_ms = utc_datetime_to_millis(request.funding_time)
-        for item in history:
-            if int(item.get("fundingTime", -1)) != funding_time_ms:
-                continue
-            actual_rate = decimal_from_text(item["fundingRate"])
-            mark_price = (
-                decimal_from_text(item["markPrice"])
-                if item.get("markPrice") is not None
-                else None
-            )
-            await self.repository.mark_event_confirmed(
-                request.symbol,
-                request.funding_time,
-                actual_rate,
-                mark_price,
-                utc_now(),
-            )
-            logger.info(
-                "confirmed funding event %s %s",
-                request.symbol,
-                request.funding_time.isoformat(),
-            )
-            return True
-        return False
+        return await self.service.try_confirm(request)

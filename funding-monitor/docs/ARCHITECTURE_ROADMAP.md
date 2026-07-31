@@ -41,6 +41,9 @@ flowchart TD
     FS --> FIB[Funding Interval Builder]
     FE[Confirmed Funding Events] --> FIB
     FIB --> FIS[Funding Interval Summaries]
+    FIS --> SVE[Strategy Validation Engine]
+    CEV --> SVE
+    SVE --> SVR[Strategy Validation Results]
     FIS --> FIE[Funding Intelligence Engine]
     FIE --> SFP[Symbol Funding Profiles]
     CEV --> PDE[Portfolio Decision Engine]
@@ -57,6 +60,8 @@ flowchart TD
         FE
         FIB
         FIS
+        SVE
+        SVR
     end
 
     subgraph Future Decision Layer
@@ -96,9 +101,32 @@ This flow has two separate analytical tracks:
 2. Long-term intelligence:
    `FundingSnapshot + confirmed FundingEvent -> FundingIntervalBuilder -> FundingIntervalSummary -> FundingIntelligenceEngine -> SymbolFundingProfile`
 
+3. Historical strategy validation:
+   `FundingIntervalSummary + FundingSnapshot + FundingEvent + InstrumentMapping -> StrategyValidationEngine -> StrategyValidationResult`
+
 These tracks must stay separate. Current signal quality answers whether a
 symbol is interesting right now. Long-term intelligence answers whether a symbol
-is generally worth trading.
+is generally worth trading. Strategy validation answers how historical rules
+would have behaved under explicitly configured replay assumptions.
+
+## Operational Runtime Pipeline
+
+Stage 3.6 adds runtime orchestration without merging business logic into one
+object. The operational loop is:
+
+```text
+sync symbols
+-> collect snapshots
+-> observe/create funding events
+-> confirm due funding events
+-> evaluate candidates on a schedule
+-> build funding interval summaries for confirmed events
+-> repeat
+```
+
+The orchestrator is allowed to call services. It must not contain parser logic,
+candidate scoring, interval summary calculations, strategy validation logic, or
+trading decisions.
 
 ## Module Responsibilities
 
@@ -183,12 +211,15 @@ Owns:
 - WebSocket connection lifecycle
 - reconnect behavior
 - snapshot throttling
+- snapshot batch flush lifecycle
 - conversion from `MarkPriceUpdate` to `FundingSnapshot`
 - enqueueing snapshot persistence
 
 Does not own:
 
 - candidate scoring
+- candidate evaluation rules
+- interval summary calculations
 - threshold policy beyond capture mode
 - long-term statistics
 - portfolio selection
@@ -203,10 +234,11 @@ Allowed dependencies:
 - snapshot service
 - funding repository
 - funding event service
+- operational pipeline orchestrator
 
 Forbidden dependencies:
 
-- `CandidateEngine`
+- `CandidateEngine` internals
 - `FundingIntelligenceEngine`
 - `PortfolioDecisionEngine`
 - `ExecutionEngine`
@@ -214,7 +246,62 @@ Forbidden dependencies:
 Architecture rule:
 
 Funding Collector answers only: "Did we receive useful market data, and should
-we store this snapshot?" It never answers: "Should we trade?"
+we store this snapshot?" It may start the operational orchestrator, but it never
+answers: "Should we trade?"
+
+### Pipeline Orchestrator
+
+Purpose:
+
+The pipeline orchestrator keeps observation-time services running on explicit
+intervals.
+
+Inputs:
+
+- configured intervals
+- stop signal
+- repositories
+- public REST client for confirmation
+
+Outputs:
+
+- candidate evaluation batches
+- confirmation backfill attempts
+- funding interval summary batches
+- lifecycle logs
+
+Owns:
+
+- scheduling service calls
+- error isolation between pipeline stages
+- graceful cancellation
+
+Does not own:
+
+- WebSocket parsing
+- snapshot persistence policy
+- Candidate Engine scoring
+- Funding Interval Builder calculations
+- Strategy Validation replay
+- portfolio or execution decisions
+
+Allowed dependencies:
+
+- candidate evaluation pipeline service
+- confirmation backfill service
+- funding interval backfill service
+- settings
+
+Forbidden dependencies:
+
+- exchange private APIs
+- order execution
+- direct score formula changes
+- market-cost collectors
+
+Architecture rule:
+
+The orchestrator coordinates; it does not decide.
 
 ### Funding Snapshots
 
@@ -867,6 +954,81 @@ Architecture rule:
 Funding Intelligence works only on aggregated interval data. It must not depend
 on current snapshots.
 
+### Strategy Validation Engine
+
+Purpose:
+
+Strategy Validation Engine answers:
+
+```text
+What would have happened if this positive funding strategy had been replayed
+historically with these parameters?
+```
+
+Current scope:
+
+- positive funding only
+- long Spot plus short USD-M perpetual futures
+- funding-only validation with confirmed realized funding
+- explicit `insufficient_market_data` when full economic prices are missing
+- parameter grid comparison
+- persisted run, result, and aggregate records
+
+Inputs:
+
+- confirmed `FundingEvent`
+- related `FundingSnapshot` history
+- `InstrumentMapping`
+- optional latest `CandidateEvaluation`
+- optional `FundingIntervalSummary`
+- immutable `StrategyValidationConfig`
+- optional future historical market-data provider
+
+Outputs:
+
+- `StrategyValidationRun`
+- `StrategyValidationResult`
+- `StrategyValidationAggregate`
+- CSV and text reports
+
+Owns:
+
+- historical replay orchestration
+- signal entry timing rules for replay
+- data quality classification
+- funding-only gross yield metrics
+- full economic calculation only when complete market prices are supplied
+- parameter grid comparison
+
+Does not own:
+
+- current candidate scoring
+- Candidate Engine statuses
+- WebSocket collection
+- exchange private APIs
+- portfolio allocation
+- order placement
+- symbol reliability profiles
+
+Allowed dependencies:
+
+- model helpers
+- funding and mapping repositories through its own repository layer
+- pure signal/data-quality/economic calculators
+
+Forbidden dependencies:
+
+- direct exchange private clients
+- execution engine
+- portfolio decision engine
+- modifying Candidate Engine outputs
+
+Architecture rule:
+
+Strategy Validation is a research side module. It may read historical facts and
+candidate outputs, but it must not feed execution decisions directly or mutate
+Candidate Engine behavior.
+
 ### Symbol Funding Profiles
 
 Purpose:
@@ -1131,6 +1293,25 @@ Do not use it for:
 - direct execution
 - current signal classification
 
+### StrategyValidationResult
+
+Stores one historical replay outcome for one funding event and one immutable
+strategy configuration.
+
+Use it for:
+
+- funding-only historical validation
+- signal quality research
+- parameter comparison
+- gross funding yield analysis
+- identifying missing market data for future full backtests
+
+Do not use it for:
+
+- production order placement
+- claiming net profitability without complete spot/futures prices and costs
+- mutating Candidate Engine status
+
 ### SymbolFundingProfile
 
 Stores long-term exchange-symbol statistics.
@@ -1264,6 +1445,51 @@ Implemented responsibilities:
 - candidate persistence
 - funding interval summary foundation
 - future funding intelligence placeholder
+
+### Stage 3.5: Strategy Validation Engine
+
+Implemented responsibilities:
+
+- immutable strategy validation configuration
+- historical event replay for positive funding
+- no-lookahead signal detection
+- data quality checks
+- funding-only gross funding outcome calculation
+- full economic status path with explicit missing-market-data handling
+- parameter grid validation
+- PostgreSQL persistence for runs, results, and aggregates
+- validation reports, compare command, and CSV export
+
+Must not:
+
+- replace Candidate Engine
+- change Candidate Engine score or statuses
+- use mark price as a hidden spot price substitute
+- claim net PnL without complete historical market data
+- place orders
+
+### Stage 3.6: Data Pipeline Reliability
+
+Implemented responsibilities:
+
+- explicit snapshot persistence policy
+- batch snapshot persistence with final shutdown flush
+- collector lifecycle logs
+- collector health command with JSON and critical exit codes
+- symbol coverage diagnostics
+- pipeline status command
+- manual candidate evaluation command
+- overdue confirmation backfill command
+- funding interval summary backfill command
+- periodic runtime orchestration from `collect`
+
+Must not:
+
+- change Candidate Engine score or statuses
+- add market price, order book, or execution collectors
+- delete historical snapshots
+- create synthetic snapshots or false complete summaries
+- start Stage 4 work
 
 ### Stage 4: Funding Intelligence
 

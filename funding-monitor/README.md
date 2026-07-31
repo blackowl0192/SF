@@ -28,6 +28,9 @@
 - Stage 3 Positive Funding Candidate Engine evaluates current positive funding opportunities with rule-based statuses, score components, rejection reasons, and persistence into PostgreSQL.
 - Funding Interval Analytics Foundation links confirmed realized funding events with their predicted snapshots for future reliability analysis.
 - Funding Intelligence foundation prepares exchange-aware symbol profiles without using them yet.
+- Stage 3.5 Strategy Validation Engine replays confirmed historical events for the positive funding long Spot plus short perpetual strategy.
+- Strategy validation supports funding-only mode now and full economic mode only when complete historical market prices are available.
+- Stage 3.6 Data Pipeline Reliability adds explicit snapshot persistence policy, batch snapshot flushes, collector health diagnostics, pipeline status, manual candidate evaluation, confirmation backfill, and interval summary backfill.
 - Live confirmation has been verified for `COTIUSDT`, `DEXEUSDT`, `ERAUSDT`, and `ESPORTSUSDT`.
 - `confirmation_failed` was `0` in the verified live run.
 - `ruff`, `mypy`, and `pytest` pass for the current implementation.
@@ -57,6 +60,8 @@ It does not use SQLAlchemy, Docker, FastAPI, private Binance endpoints, API keys
 - Stage 2.2: Funding History Engine - completed.
 - Stage 2.3: Instrument Mapping - completed.
 - Stage 3: Positive Funding Candidate Engine - completed.
+- Stage 3.5: Strategy Validation Engine - completed.
+- Stage 3.6: data collection reliability and pipeline completion - completed.
 - Stage 4: market risk, spread, fees, depth, and slippage.
 - Stage 5: net edge.
 - Stage 6: symbol reliability.
@@ -116,6 +121,17 @@ CANDIDATE_PERSIST_INTERVAL_SECONDS=60
 CANDIDATE_MAX_RESULTS=50
 FUNDING_INTERVAL_POINT_TOLERANCE_SECONDS=90
 FUNDING_INTERVAL_SUMMARY_BATCH_SIZE=500
+SNAPSHOT_PERSIST_INTERVAL_SECONDS=60
+SNAPSHOT_BATCH_SIZE=500
+SNAPSHOT_FLUSH_INTERVAL_SECONDS=5
+COLLECTOR_HEALTH_WINDOW_MINUTES=5
+COLLECTOR_HEALTH_MAX_SNAPSHOT_AGE_SECONDS=180
+COLLECTOR_HEALTH_MIN_COVERAGE_RATIO=0.80
+CANDIDATE_EVALUATION_INTERVAL_SECONDS=60
+INTERVAL_SUMMARY_BUILD_INTERVAL_SECONDS=300
+CONFIRMATION_BACKFILL_INTERVAL_SECONDS=300
+CONFIRMATION_BACKFILL_BATCH_SIZE=100
+CONFIRMATION_OVERDUE_GRACE_MINUTES=30
 ```
 
 `ABS_MIN_FUNDING_RATE` is used for status and aggregate reporting. It does not stop snapshots below the threshold from being saved.
@@ -143,6 +159,10 @@ python -m funding_monitor collect
 python -m funding_monitor status
 python -m funding_monitor snapshot-stats
 python -m funding_monitor snapshot-stats --minutes 60
+python -m funding_monitor collector-health
+python -m funding_monitor collector-health --json
+python -m funding_monitor pipeline-status
+python -m funding_monitor coverage-report --minutes 60 --limit 20
 python -m funding_monitor history
 python -m funding_monitor metrics BTCUSDT
 python -m funding_monitor metrics BTCUSDT --window-minutes 15
@@ -160,13 +180,79 @@ python -m funding_monitor candidates --symbol BTCUSDT
 python -m funding_monitor candidates --include-rejected
 python -m funding_monitor candidates --no-persist
 python -m funding_monitor candidates --json
+python -m funding_monitor evaluate-candidates
+python -m funding_monitor evaluate-candidates --symbols BTCUSDT,ETHUSDT --dry-run
 python -m funding_monitor candidate-rejections
 python -m funding_monitor build-funding-interval-summaries
+python -m funding_monitor backfill-confirmations
+python -m funding_monitor backfill-funding-intervals
+python -m funding_monitor backfill-funding-intervals --from 2024-01-01T00:00:00+00:00 --to 2024-01-02T00:00:00+00:00 --symbols BTCUSDT
+python -m funding_monitor validate-strategy --limit 500
+python -m funding_monitor validate-strategy --symbols BTCUSDT,ETHUSDT --funding-threshold-rate 0.0003
+python -m funding_monitor validate-grid --funding-threshold-rates 0.0002,0.0003 --entry-minutes-grid 30,60
+python -m funding_monitor validation-report --run-id 1
+python -m funding_monitor validation-report --run-id 1 --export-csv data/validation_run_1.csv
+python -m funding_monitor validation-compare --run-id 1 --run-id 2
 python -m funding_monitor recent-events --limit 20
 python -m funding_monitor export-csv --output data/funding_events.csv
 ```
 
 `python -m funding_monitor init-db` is kept as an alias for `migrate`.
+
+For continuous operation, run:
+
+```powershell
+python -m funding_monitor collect
+```
+
+Stop it with `Ctrl+C`. The collector handles SIGINT/SIGTERM by stopping the
+WebSocket loop, flushing the current snapshot batch, cancelling background
+pipeline tasks, closing confirmation tasks, and closing the PostgreSQL pool.
+
+## Data Pipeline Reliability
+
+The snapshot persistence policy is explicit:
+
+- outside the funding window, save one heartbeat snapshot per symbol every
+  `SNAPSHOT_PERSIST_INTERVAL_SECONDS`;
+- inside the configured pre/post funding window, use
+  `DETAILED_SNAPSHOT_INTERVAL_SECONDS`;
+- accumulate snapshots in memory and flush them in batches controlled by
+  `SNAPSHOT_BATCH_SIZE` and `SNAPSHOT_FLUSH_INTERVAL_SECONDS`;
+- keep storing all active symbols and all funding directions.
+
+With 529 active symbols and `SNAPSHOT_PERSIST_INTERVAL_SECONDS=60`, the normal
+expected volume is about `529 * 1,440 = 761,760` snapshots per day, or about
+`22,852,800` snapshots per 30-day month before detailed funding-window writes.
+If the detailed interval remains `1` second for three 15-minute funding windows
+per day, the daily volume can rise to about `2,166,255` snapshots.
+
+The collector also starts a lightweight operational orchestrator:
+
+```text
+collect snapshots
+-> create/observe funding events
+-> confirm due funding events
+-> evaluate candidates on a schedule
+-> build funding interval summaries for confirmed events
+-> repeat
+```
+
+Use `collector-health` for critical collection health and `pipeline-status` for
+all pipeline stages. `collector-health --json` is machine-readable and exits
+non-zero when snapshots are stale, coverage is too low, confirmation backlog is
+critical, or candidate evaluation has stopped.
+
+Pipeline warning codes:
+
+- `SNAPSHOT_COLLECTION_STALE`
+- `LOW_SYMBOL_COVERAGE`
+- `CONFIRMATION_BACKLOG`
+- `CANDIDATE_PIPELINE_NOT_RUNNING`
+- `INTERVAL_SUMMARY_BACKLOG`
+
+Manual backfill commands are safe to rerun. They do not create artificial market
+data and do not replace incomplete intervals with false complete summaries.
 
 ## Tables
 
@@ -185,6 +271,12 @@ python -m funding_monitor export-csv --output data/funding_events.csv
 `funding_interval_summaries` stores aggregated predicted funding behavior inside a funding interval and links it to the confirmed realized funding event. It is exchange-aware and includes peak predicted timestamp, signal start, and positive streak fields for future analytics.
 
 `symbol_funding_profiles` is a prepared table for the future Funding Intelligence Engine. Stage 3 does not populate it.
+
+`strategy_validation_runs` stores immutable Strategy Validation Engine run configuration, dataset selection, status, and counts.
+
+`strategy_validation_results` stores one historical replay result per funding event. Funding-only results store gross funding PnL/yield and never claim net PnL without market prices.
+
+`strategy_validation_aggregates` stores grouped validation metrics for reports and run comparisons.
 
 ## Funding History Engine
 
@@ -237,6 +329,16 @@ The future Funding Intelligence Engine will operate on `funding_interval_summari
 Signal Frequency means how often predicted funding became high. Realized Reliability means how often a high predicted signal ended as a high confirmed payout.
 
 The placeholder module is `src/funding_monitor/funding_intelligence.py`.
+
+## Stage 3.5 Strategy Validation Engine
+
+Strategy Validation Engine is a research/backtesting layer for the positive funding strategy: long Spot plus short USD-M perpetual futures. It replays confirmed historical funding events using stored snapshots and instrument mappings.
+
+The default mode is `funding_only`. It validates signal quality, realized funding, prediction error, persistence, success frequency, and gross funding yield. It does not report net PnL. CLI funding thresholds are decimal rates: `--funding-threshold-rate 0.0003` means `0.03%`.
+
+`full_economic` mode is available as an explicit status path, but the default market-data provider is unavailable. Until real historical spot/futures entry and exit prices, fees, spread, depth, and slippage are stored or supplied, full economic runs return `insufficient_market_data` for otherwise eligible events.
+
+See `docs/STAGE_3_5_STRATEGY_VALIDATION.md` for details.
 
 ## Predicted Rate And Actual Rate
 

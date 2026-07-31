@@ -50,3 +50,14 @@ def test_analytics_defaults_use_decimal_and_observation_mode(monkeypatch) -> Non
     assert settings.candidate_max_results == 50
     assert settings.funding_interval_point_tolerance_seconds == 90
     assert settings.funding_interval_summary_batch_size == 500
+    assert settings.snapshot_persist_interval_seconds == 60
+    assert settings.snapshot_batch_size == 500
+    assert settings.snapshot_flush_interval_seconds == 5
+    assert settings.collector_health_window_minutes == 5
+    assert settings.collector_health_max_snapshot_age_seconds == 180
+    assert settings.collector_health_min_coverage_ratio == Decimal("0.80")
+    assert settings.candidate_evaluation_interval_seconds == 60
+    assert settings.interval_summary_build_interval_seconds == 300
+    assert settings.confirmation_backfill_interval_seconds == 300
+    assert settings.confirmation_backfill_batch_size == 100
+    assert settings.confirmation_overdue_grace_minutes == 30

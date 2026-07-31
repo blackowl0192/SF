@@ -67,6 +67,48 @@ ON CONFLICT(symbol, event_time, capture_mode) DO NOTHING
 RETURNING id
 """
 
+INSERT_SNAPSHOTS_SQL = """
+INSERT INTO funding_snapshots (
+    symbol,
+    event_time,
+    received_at,
+    mark_price,
+    index_price,
+    estimated_settle_price,
+    predicted_funding_rate,
+    funding_rate,
+    interest_rate,
+    next_funding_time,
+    seconds_until_funding,
+    seconds_to_funding,
+    premium_rate,
+    funding_direction,
+    funding_interval_hours,
+    capture_mode
+)
+SELECT *
+FROM UNNEST(
+    $1::text[],
+    $2::timestamptz[],
+    $3::timestamptz[],
+    $4::numeric[],
+    $5::numeric[],
+    $6::numeric[],
+    $7::numeric[],
+    $8::numeric[],
+    $9::numeric[],
+    $10::timestamptz[],
+    $11::integer[],
+    $12::integer[],
+    $13::numeric[],
+    $14::text[],
+    $15::integer[],
+    $16::text[]
+)
+ON CONFLICT(symbol, event_time, capture_mode) DO NOTHING
+RETURNING symbol, event_time, capture_mode
+"""
+
 UPSERT_FUNDING_EVENT_SQL = """
 INSERT INTO funding_events (
     symbol,
@@ -117,6 +159,147 @@ SET next_predicted_rate = COALESCE(next_predicted_rate, $1)
 WHERE symbol = $2 AND funding_time = $3
 """
 
+UPSERT_FUNDING_EVENTS_FROM_SNAPSHOTS_SQL = """
+WITH rows AS (
+    SELECT *
+    FROM UNNEST(
+        $1::text[],
+        $2::timestamptz[],
+        $3::integer[],
+        $4::numeric[],
+        $5::timestamptz[]
+    ) AS row_data(
+        symbol,
+        funding_time,
+        funding_interval_hours,
+        predicted_funding_rate,
+        event_time
+    )
+),
+first_rows AS (
+    SELECT DISTINCT ON (symbol, funding_time)
+        symbol,
+        funding_time,
+        predicted_funding_rate
+    FROM rows
+    ORDER BY symbol, funding_time, event_time
+),
+last_rows AS (
+    SELECT DISTINCT ON (symbol, funding_time)
+        symbol,
+        funding_time,
+        funding_interval_hours,
+        predicted_funding_rate
+    FROM rows
+    ORDER BY symbol, funding_time, event_time DESC
+)
+INSERT INTO funding_events (
+    symbol,
+    funding_time,
+    funding_interval_hours,
+    first_predicted_rate,
+    last_predicted_rate,
+    status
+)
+SELECT
+    last_rows.symbol,
+    last_rows.funding_time,
+    last_rows.funding_interval_hours,
+    first_rows.predicted_funding_rate,
+    last_rows.predicted_funding_rate,
+    'waiting'
+FROM last_rows
+JOIN first_rows USING (symbol, funding_time)
+ON CONFLICT(symbol, funding_time) DO UPDATE SET
+    funding_interval_hours = excluded.funding_interval_hours,
+    first_predicted_rate = COALESCE(
+        funding_events.first_predicted_rate,
+        excluded.first_predicted_rate
+    ),
+    last_predicted_rate = excluded.last_predicted_rate
+RETURNING symbol, funding_time
+"""
+
+UPDATE_EVENT_PREDICTIONS_FOR_EVENTS_SQL = """
+WITH touched AS (
+    SELECT DISTINCT *
+    FROM UNNEST($1::text[], $2::timestamptz[]) AS row_data(
+        symbol,
+        funding_time
+    )
+),
+event_snapshots AS (
+    SELECT fs.*
+    FROM funding_snapshots fs
+    JOIN touched
+      ON touched.symbol = fs.symbol
+     AND touched.funding_time = fs.next_funding_time
+),
+last_rows AS (
+    SELECT DISTINCT ON (symbol, next_funding_time)
+        symbol,
+        next_funding_time AS funding_time,
+        predicted_funding_rate
+    FROM event_snapshots
+    ORDER BY symbol, next_funding_time, event_time DESC
+),
+ten_minute AS (
+    SELECT DISTINCT ON (fs.symbol, fs.next_funding_time)
+        fs.symbol,
+        fs.next_funding_time AS funding_time,
+        fs.predicted_funding_rate
+    FROM event_snapshots fs
+    ORDER BY
+        fs.symbol,
+        fs.next_funding_time,
+        ABS(EXTRACT(
+            EPOCH FROM fs.event_time - (fs.next_funding_time - INTERVAL '10 minutes')
+        ))
+),
+five_minute AS (
+    SELECT DISTINCT ON (fs.symbol, fs.next_funding_time)
+        fs.symbol,
+        fs.next_funding_time AS funding_time,
+        fs.predicted_funding_rate
+    FROM event_snapshots fs
+    ORDER BY
+        fs.symbol,
+        fs.next_funding_time,
+        ABS(EXTRACT(
+            EPOCH FROM fs.event_time - (fs.next_funding_time - INTERVAL '5 minutes')
+        ))
+),
+one_minute AS (
+    SELECT DISTINCT ON (fs.symbol, fs.next_funding_time)
+        fs.symbol,
+        fs.next_funding_time AS funding_time,
+        fs.predicted_funding_rate
+    FROM event_snapshots fs
+    ORDER BY
+        fs.symbol,
+        fs.next_funding_time,
+        ABS(EXTRACT(
+            EPOCH FROM fs.event_time - (fs.next_funding_time - INTERVAL '1 minute')
+        ))
+)
+UPDATE funding_events fe
+SET
+    predicted_rate_10m_before = ten_minute.predicted_funding_rate,
+    predicted_rate_5m_before = five_minute.predicted_funding_rate,
+    predicted_rate_1m_before = one_minute.predicted_funding_rate,
+    last_predicted_rate = COALESCE(
+        last_rows.predicted_funding_rate,
+        fe.last_predicted_rate
+    )
+FROM touched
+LEFT JOIN ten_minute USING (symbol, funding_time)
+LEFT JOIN five_minute USING (symbol, funding_time)
+LEFT JOIN one_minute USING (symbol, funding_time)
+LEFT JOIN last_rows USING (symbol, funding_time)
+WHERE fe.symbol = touched.symbol
+  AND fe.funding_time = touched.funding_time
+"""
+
 
 class FundingRepository:
     def __init__(self, database: PostgresDatabase) -> None:
@@ -159,27 +342,50 @@ class FundingRepository:
         return {row["symbol"]: self._row_to_symbol(row) for row in rows}
 
     async def insert_snapshot(self, snapshot: FundingSnapshot) -> bool:
+        return bool(await self.insert_snapshots([snapshot]))
+
+    async def insert_snapshots(
+        self,
+        snapshots: Iterable[FundingSnapshot],
+    ) -> list[FundingSnapshot]:
+        rows = list(snapshots)
+        if not rows:
+            return []
         async with self.database.acquire() as connection:
-            row = await connection.fetchrow(
-                INSERT_SNAPSHOT_SQL,
+            inserted_rows = await connection.fetch(
+                INSERT_SNAPSHOTS_SQL,
+                [snapshot.symbol for snapshot in rows],
+                [ensure_utc(snapshot.event_time) for snapshot in rows],
+                [ensure_utc(snapshot.received_at) for snapshot in rows],
+                [snapshot.mark_price for snapshot in rows],
+                [snapshot.index_price for snapshot in rows],
+                [snapshot.estimated_settle_price for snapshot in rows],
+                [snapshot.predicted_funding_rate for snapshot in rows],
+                [snapshot.funding_rate for snapshot in rows],
+                [snapshot.interest_rate for snapshot in rows],
+                [ensure_utc(snapshot.next_funding_time) for snapshot in rows],
+                [snapshot.seconds_until_funding for snapshot in rows],
+                [snapshot.seconds_to_funding for snapshot in rows],
+                [snapshot.premium_rate for snapshot in rows],
+                [snapshot.funding_direction for snapshot in rows],
+                [snapshot.funding_interval_hours for snapshot in rows],
+                [snapshot.capture_mode for snapshot in rows],
+            )
+        inserted_keys = {
+            (row["symbol"], ensure_utc(row["event_time"]), row["capture_mode"])
+            for row in inserted_rows
+        }
+        inserted: list[FundingSnapshot] = []
+        for snapshot in rows:
+            key = (
                 snapshot.symbol,
                 ensure_utc(snapshot.event_time),
-                ensure_utc(snapshot.received_at),
-                snapshot.mark_price,
-                snapshot.index_price,
-                snapshot.estimated_settle_price,
-                snapshot.predicted_funding_rate,
-                snapshot.funding_rate,
-                snapshot.interest_rate,
-                ensure_utc(snapshot.next_funding_time),
-                snapshot.seconds_until_funding,
-                snapshot.seconds_to_funding,
-                snapshot.premium_rate,
-                snapshot.funding_direction,
-                snapshot.funding_interval_hours,
                 snapshot.capture_mode,
             )
-        return row is not None
+            if key in inserted_keys:
+                inserted.append(snapshot)
+                inserted_keys.remove(key)
+        return inserted
 
     async def create_or_get_funding_event(
         self,
@@ -312,6 +518,27 @@ class FundingRepository:
                 ensure_utc(previous_funding_time),
             )
 
+    async def observe_snapshots(self, snapshots: Iterable[FundingSnapshot]) -> int:
+        rows = list(snapshots)
+        if not rows:
+            return 0
+        async with self.database.acquire() as connection, connection.transaction():
+            touched_rows = await connection.fetch(
+                UPSERT_FUNDING_EVENTS_FROM_SNAPSHOTS_SQL,
+                [snapshot.symbol for snapshot in rows],
+                [ensure_utc(snapshot.next_funding_time) for snapshot in rows],
+                [snapshot.funding_interval_hours for snapshot in rows],
+                [snapshot.predicted_funding_rate for snapshot in rows],
+                [ensure_utc(snapshot.event_time) for snapshot in rows],
+            )
+            if touched_rows:
+                await connection.execute(
+                    UPDATE_EVENT_PREDICTIONS_FOR_EVENTS_SQL,
+                    [row["symbol"] for row in touched_rows],
+                    [ensure_utc(row["funding_time"]) for row in touched_rows],
+                )
+        return len(touched_rows)
+
     async def status_summary(
         self, abs_threshold: Decimal = Decimal("0.0003")
     ) -> dict[str, Any]:
@@ -418,6 +645,30 @@ class FundingRepository:
                 ORDER BY funding_time DESC, symbol
                 LIMIT $1
                 """,
+                limit,
+            )
+        return [self._row_to_event(row) for row in rows]
+
+    async def funding_events_for_confirmation(
+        self,
+        *,
+        due_before: datetime,
+        limit: int,
+        retry_failed: bool = False,
+    ) -> list[FundingEvent]:
+        statuses = ["waiting", "confirmation_failed"] if retry_failed else ["waiting"]
+        async with self.database.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT *
+                FROM funding_events
+                WHERE status = ANY($1::text[])
+                  AND funding_time <= $2
+                ORDER BY funding_time, symbol
+                LIMIT $3
+                """,
+                statuses,
+                ensure_utc(due_before),
                 limit,
             )
         return [self._row_to_event(row) for row in rows]

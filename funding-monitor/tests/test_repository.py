@@ -7,9 +7,12 @@ from funding_monitor.models import FundingSnapshot
 from funding_monitor.repository import (
     CONFIRM_EVENT_SQL,
     INSERT_SNAPSHOT_SQL,
+    INSERT_SNAPSHOTS_SQL,
+    UPDATE_EVENT_PREDICTIONS_FOR_EVENTS_SQL,
     UPDATE_EVENT_PREDICTIONS_SQL,
     UPDATE_NEXT_PREDICTED_RATE_SQL,
     UPSERT_FUNDING_EVENT_SQL,
+    UPSERT_FUNDING_EVENTS_FROM_SNAPSHOTS_SQL,
     UPSERT_SYMBOLS_SQL,
     FundingRepository,
 )
@@ -19,6 +22,9 @@ def test_repository_uses_postgresql_placeholders() -> None:
     sql = (
         f"{UPSERT_SYMBOLS_SQL}\n"
         f"{INSERT_SNAPSHOT_SQL}\n"
+        f"{INSERT_SNAPSHOTS_SQL}\n"
+        f"{UPSERT_FUNDING_EVENTS_FROM_SNAPSHOTS_SQL}\n"
+        f"{UPDATE_EVENT_PREDICTIONS_FOR_EVENTS_SQL}\n"
         f"{UPSERT_FUNDING_EVENT_SQL}\n"
         f"{UPDATE_EVENT_PREDICTIONS_SQL}\n"
         f"{CONFIRM_EVENT_SQL}\n"
@@ -46,6 +52,15 @@ def test_on_conflict_keeps_old_semantics() -> None:
     )
 
 
+def test_batch_funding_event_observation_uses_set_based_sql() -> None:
+    assert "UNNEST" in UPSERT_FUNDING_EVENTS_FROM_SNAPSHOTS_SQL
+    assert "ON CONFLICT(symbol, funding_time) DO UPDATE" in (
+        UPSERT_FUNDING_EVENTS_FROM_SNAPSHOTS_SQL
+    )
+    assert "UPDATE funding_events fe" in UPDATE_EVENT_PREDICTIONS_FOR_EVENTS_SQL
+    assert "JOIN touched" in UPDATE_EVENT_PREDICTIONS_FOR_EVENTS_SQL
+
+
 def test_repository_passes_decimal_and_utc_datetime_without_float_conversion() -> None:
     connection = RecordingConnection()
     repository = FundingRepository(RecordingDatabase(connection))  # type: ignore[arg-type]
@@ -60,16 +75,16 @@ def test_repository_passes_decimal_and_utc_datetime_without_float_conversion() -
 
     assert inserted
     assert len(connection.args) == 16
-    assert isinstance(connection.args[3], Decimal)
-    assert isinstance(connection.args[6], Decimal)
-    assert connection.args[3] == Decimal("101.0")
-    assert connection.args[7] == Decimal("0.00010000")
-    assert connection.args[11] == 1200
-    assert connection.args[12] == Decimal("0.01")
-    assert connection.args[13] == "positive"
-    assert connection.args[14] == 8
-    assert connection.args[1].tzinfo is UTC
-    assert connection.args[9].tzinfo is UTC
+    assert isinstance(connection.args[3][0], Decimal)
+    assert isinstance(connection.args[6][0], Decimal)
+    assert connection.args[3][0] == Decimal("101.0")
+    assert connection.args[7][0] == Decimal("0.00010000")
+    assert connection.args[11][0] == 1200
+    assert connection.args[12][0] == Decimal("0.01")
+    assert connection.args[13][0] == "positive"
+    assert connection.args[14][0] == 8
+    assert connection.args[1][0].tzinfo is UTC
+    assert connection.args[9][0].tzinfo is UTC
 
 
 def test_repository_maps_new_snapshot_columns_from_rows() -> None:
@@ -168,7 +183,7 @@ def test_snapshots_below_threshold_continue_saving() -> None:
     inserted = asyncio.run(repository.insert_snapshot(snapshot))
 
     assert inserted
-    assert connection.args[7] == Decimal("0.000299")
+    assert connection.args[7][0] == Decimal("0.000299")
 
 
 def test_negative_funding_values_are_saved() -> None:
@@ -183,8 +198,8 @@ def test_negative_funding_values_are_saved() -> None:
     inserted = asyncio.run(repository.insert_snapshot(snapshot))
 
     assert inserted
-    assert connection.args[7] == Decimal("-0.000300")
-    assert connection.args[13] == "negative"
+    assert connection.args[7][0] == Decimal("-0.000300")
+    assert connection.args[13][0] == "negative"
 
 
 def make_snapshot(
@@ -218,6 +233,16 @@ class RecordingConnection:
     async def fetchrow(self, _sql, *args):
         self.args = args
         return {"id": 1}
+
+    async def fetch(self, _sql, *args):
+        self.args = args
+        return [
+            {
+                "symbol": args[0][0],
+                "event_time": args[1][0],
+                "capture_mode": args[15][0],
+            }
+        ]
 
 
 class StatusConnection:

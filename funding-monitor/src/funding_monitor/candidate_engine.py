@@ -321,6 +321,10 @@ class FundingIntervalSummaryStore(Protocol):
     async def confirmed_events_for_interval_summaries(
         self,
         limit: int,
+        *,
+        period_start: datetime | None = None,
+        period_end: datetime | None = None,
+        symbols: tuple[str, ...] = (),
     ) -> list[FundingEvent]:
         ...
 
@@ -335,6 +339,12 @@ class FundingIntervalSummaryStore(Protocol):
         symbol: str,
         funding_time: datetime,
     ) -> list[FundingSnapshot]:
+        ...
+
+    async def snapshots_for_intervals(
+        self,
+        events: Iterable[FundingEvent],
+    ) -> dict[tuple[str, datetime], list[FundingSnapshot]]:
         ...
 
     async def upsert_interval_summaries(
@@ -1063,6 +1073,7 @@ class FundingIntervalAnalyticsService:
             self.config.interval_summary_batch_size
         )
         existing_keys = await self.repository.existing_interval_summary_keys(events)
+        snapshots_by_event = await self.repository.snapshots_for_intervals(events)
         summaries: list[FundingIntervalSummary] = []
         failed = 0
         skipped = 0
@@ -1073,9 +1084,9 @@ class FundingIntervalAnalyticsService:
                 skipped += 1
                 continue
             try:
-                snapshots = await self.repository.snapshots_for_interval(
-                    event.symbol,
-                    event.funding_time,
+                snapshots = snapshots_by_event.get(
+                    (event.symbol, ensure_utc(event.funding_time)),
+                    [],
                 )
                 summary = self.builder.build(event, snapshots)
                 summaries.append(summary)

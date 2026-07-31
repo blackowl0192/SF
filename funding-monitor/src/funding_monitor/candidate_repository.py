@@ -290,20 +290,32 @@ class CandidateRepository:
     async def confirmed_events_for_interval_summaries(
         self,
         limit: int,
+        *,
+        period_start: datetime | None = None,
+        period_end: datetime | None = None,
+        symbols: tuple[str, ...] = (),
     ) -> list[FundingEvent]:
+        query = """
+        SELECT *
+        FROM funding_events
+        WHERE status = 'confirmed'
+          AND actual_funding_rate IS NOT NULL
+        """
+        args: list[Any] = []
+        if period_start is not None:
+            args.append(ensure_utc(period_start))
+            query += f"\nAND funding_time >= ${len(args)}"
+        if period_end is not None:
+            args.append(ensure_utc(period_end))
+            query += f"\nAND funding_time < ${len(args)}"
+        if symbols:
+            args.append(list(symbols))
+            query += f"\nAND symbol = ANY(${len(args)}::text[])"
+        args.append(limit)
+        query += f"\nORDER BY funding_time DESC, symbol\nLIMIT ${len(args)}"
         try:
             async with self.database.acquire() as connection:
-                rows = await connection.fetch(
-                    """
-                    SELECT *
-                    FROM funding_events
-                    WHERE status = 'confirmed'
-                      AND actual_funding_rate IS NOT NULL
-                    ORDER BY funding_time DESC, symbol
-                    LIMIT $1
-                    """,
-                    limit,
-                )
+                rows = await connection.fetch(query, *args)
         except asyncpg.UndefinedTableError:
             return []
         return [self._funding_repository._row_to_event(row) for row in rows]
@@ -361,6 +373,45 @@ class CandidateRepository:
                 ensure_utc(funding_time),
             )
         return [self._funding_repository._row_to_snapshot(row) for row in rows]
+
+    async def snapshots_for_intervals(
+        self,
+        events: Iterable[FundingEvent],
+    ) -> dict[tuple[str, datetime], list[FundingSnapshot]]:
+        rows = list(events)
+        if not rows:
+            return {}
+        symbols = [event.symbol for event in rows]
+        funding_times = [ensure_utc(event.funding_time) for event in rows]
+        async with self.database.acquire() as connection:
+            snapshot_rows = await connection.fetch(
+                """
+                WITH requested AS (
+                    SELECT *
+                    FROM UNNEST($1::text[], $2::timestamptz[]) AS row_data(
+                        symbol,
+                        funding_time
+                    )
+                )
+                SELECT fs.*
+                FROM funding_snapshots fs
+                JOIN requested
+                  ON requested.symbol = fs.symbol
+                 AND requested.funding_time = fs.next_funding_time
+                WHERE fs.event_time <= requested.funding_time
+                ORDER BY fs.symbol, fs.next_funding_time, fs.event_time
+                """,
+                symbols,
+                funding_times,
+            )
+        snapshots_by_event: dict[tuple[str, datetime], list[FundingSnapshot]] = {}
+        for row in snapshot_rows:
+            snapshot = self._funding_repository._row_to_snapshot(row)
+            snapshots_by_event.setdefault(
+                (snapshot.symbol, ensure_utc(snapshot.next_funding_time)),
+                [],
+            ).append(snapshot)
+        return snapshots_by_event
 
     async def upsert_interval_summaries(
         self,

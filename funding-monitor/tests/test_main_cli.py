@@ -80,6 +80,127 @@ def test_parser_accepts_candidate_commands() -> None:
     assert summaries.command == "build-funding-interval-summaries"
 
 
+def test_parser_accepts_pipeline_reliability_commands() -> None:
+    parser = _build_parser()
+
+    health = parser.parse_args(["collector-health", "--json"])
+    pipeline_status = parser.parse_args(["pipeline-status", "--json"])
+    coverage = parser.parse_args(
+        ["coverage-report", "--minutes", "15", "--limit", "5", "--json"]
+    )
+    evaluate = parser.parse_args(
+        [
+            "evaluate-candidates",
+            "--symbols",
+            "BTCUSDT,ETHUSDT",
+            "--limit",
+            "2",
+            "--at",
+            "2024-01-01T00:00:00+00:00",
+            "--dry-run",
+            "--json",
+        ]
+    )
+    interval_backfill = parser.parse_args(
+        [
+            "backfill-funding-intervals",
+            "--from",
+            "2024-01-01T00:00:00+00:00",
+            "--to",
+            "2024-01-02T00:00:00+00:00",
+            "--symbols",
+            "BTCUSDT",
+            "--limit",
+            "10",
+            "--dry-run",
+            "--retry-failed",
+            "--json",
+        ]
+    )
+    confirmation_backfill = parser.parse_args(
+        ["backfill-confirmations", "--limit", "3", "--retry-failed", "--json"]
+    )
+
+    assert health.command == "collector-health"
+    assert health.json
+    assert pipeline_status.command == "pipeline-status"
+    assert coverage.minutes == 15
+    assert coverage.limit == 5
+    assert evaluate.command == "evaluate-candidates"
+    assert evaluate.symbols == "BTCUSDT,ETHUSDT"
+    assert evaluate.limit == 2
+    assert evaluate.dry_run
+    assert interval_backfill.command == "backfill-funding-intervals"
+    assert interval_backfill.period_start == "2024-01-01T00:00:00+00:00"
+    assert interval_backfill.retry_failed
+    assert confirmation_backfill.command == "backfill-confirmations"
+    assert confirmation_backfill.limit == 3
+
+
+def test_parser_accepts_strategy_validation_commands() -> None:
+    parser = _build_parser()
+
+    validation = parser.parse_args(
+        [
+            "validate-strategy",
+            "--from",
+            "2024-01-01T00:00:00+00:00",
+            "--to",
+            "2024-01-02T00:00:00+00:00",
+            "--symbol",
+            "BTCUSDT",
+            "--funding-threshold-rate",
+            "0.0004",
+            "--entry-mode",
+            "first_qualifying_signal",
+            "--validation-mode",
+            "funding_only",
+        ]
+    )
+    grid = parser.parse_args(
+        [
+            "validate-grid",
+            "--funding-threshold-rates",
+            "0.0002,0.0003",
+            "--entry-minutes-grid",
+            "30,60",
+        ]
+    )
+    report = parser.parse_args(["validation-report", "--run-id", "1"])
+    compare = parser.parse_args(
+        ["validation-compare", "--run-id", "1", "--run-id", "2"]
+    )
+
+    assert validation.command == "validate-strategy"
+    assert validation.period_start == "2024-01-01T00:00:00+00:00"
+    assert validation.symbol == ["BTCUSDT"]
+    assert validation.funding_threshold_rate == Decimal("0.0004")
+    assert validation.entry_mode == "first_qualifying_signal"
+    assert grid.command == "validate-grid"
+    assert grid.funding_threshold_rates == "0.0002,0.0003"
+    assert grid.entry_minutes_grid == "30,60"
+    assert report.run_id == 1
+    assert compare.run_id == [1, 2]
+
+
+def test_strategy_validation_threshold_cli_uses_decimal_rate_units() -> None:
+    parser = _build_parser()
+
+    explicit_rate = parser.parse_args(
+        ["validate-strategy", "--funding-threshold-rate", "0.0003"]
+    )
+    legacy_alias = parser.parse_args(
+        ["validate-strategy", "--funding-threshold", "0.03"]
+    )
+    grid = parser.parse_args(
+        ["validate-grid", "--funding-threshold-rates", "0.0002,0.0003"]
+    )
+
+    assert explicit_rate.funding_threshold_rate == Decimal("0.0003")
+    assert legacy_alias.funding_threshold_rate == Decimal("0.03")
+    assert grid.funding_threshold_rates == "0.0002,0.0003"
+
+
 def test_sync_instrument_mappings_prints_aggregates(capsys) -> None:
     _print_mapping_sync_result(
         InstrumentMappingSyncResult(
