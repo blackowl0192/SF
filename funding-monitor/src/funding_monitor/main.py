@@ -2,10 +2,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 from .binance_rest import BinanceRestClient, BinanceSpotRestClient
+from .candidate_engine import (
+    CandidateEngine,
+    CandidateEngineConfig,
+    CandidateEvaluation,
+    CandidateRejectionAggregate,
+    CandidateStatus,
+    FundingIntervalAnalyticsService,
+    FundingIntervalBuildResult,
+    RejectionReason,
+    rank_evaluations,
+)
+from .candidate_repository import CandidateRepository
 from .collector import run_collector
 from .config import Settings, load_settings
 from .database import PostgresDatabase
@@ -25,6 +39,7 @@ from .logging_config import configure_logging
 from .models import (
     FundingEvent,
     datetime_to_text,
+    decimal_from_text,
     decimal_to_percent_text,
     decimal_to_percentage_point_text,
 )
@@ -177,6 +192,50 @@ async def _run(args: argparse.Namespace, settings: Settings) -> None:
         _print_instrument_mapping_summary(mapping_summary)
         return
 
+    if args.command == "candidates":
+        config = _candidate_config_from_settings(settings)
+        async with database:
+            funding_repository = FundingRepository(database)
+            mapping_repository = InstrumentMappingRepository(database)
+            candidate_repository = CandidateRepository(database)
+            history = _create_candidate_history_service(funding_repository, settings)
+            await history.reload()
+            mappings = await mapping_repository.list_mappings()
+            engine = CandidateEngine(config=config)
+            inputs = engine.inputs_from_history(mappings, history)
+            evaluations = engine.evaluate_many(inputs)
+            if not args.no_persist:
+                await candidate_repository.upsert_evaluations(evaluations)
+        filtered = _filter_candidate_evaluations(
+            evaluations,
+            statuses=[CandidateStatus(value) for value in args.status or []],
+            symbol=args.symbol,
+            min_score=args.min_score,
+            include_rejected=args.include_rejected,
+            limit=args.top or config.max_results,
+        )
+        if args.json:
+            _print_candidates_json(filtered)
+        else:
+            _print_candidates(filtered)
+        return
+
+    if args.command == "candidate-rejections":
+        async with database:
+            aggregates = await CandidateRepository(database).latest_rejection_summary()
+        _print_candidate_rejections(aggregates)
+        return
+
+    if args.command == "build-funding-interval-summaries":
+        config = _candidate_config_from_settings(settings)
+        async with database:
+            interval_result = await FundingIntervalAnalyticsService(
+                repository=CandidateRepository(database),
+                config=config,
+            ).build_missing_summaries()
+        _print_interval_build_result(interval_result)
+        return
+
     if args.command == "recent-events":
         async with database:
             repository = FundingRepository(database)
@@ -248,6 +307,23 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     mappings_parser.add_argument("--symbol", default=None)
 
+    candidates_parser = subparsers.add_parser("candidates")
+    candidates_parser.add_argument("--top", type=int, default=None)
+    candidates_parser.add_argument("--min-score", type=_decimal_arg, default=None)
+    candidates_parser.add_argument(
+        "--status",
+        action="append",
+        choices=[status.value for status in CandidateStatus],
+        default=None,
+    )
+    candidates_parser.add_argument("--symbol", default=None)
+    candidates_parser.add_argument("--include-rejected", action="store_true")
+    candidates_parser.add_argument("--no-persist", action="store_true")
+    candidates_parser.add_argument("--json", action="store_true")
+
+    subparsers.add_parser("candidate-rejections")
+    subparsers.add_parser("build-funding-interval-summaries")
+
     recent_parser = subparsers.add_parser("recent-events")
     recent_parser.add_argument("--limit", type=int, default=20)
 
@@ -266,6 +342,58 @@ def _create_history_service(
         default_metrics_window=settings.default_metrics_window,
         abs_threshold=settings.abs_min_funding_rate,
     )
+
+
+def _create_candidate_history_service(
+    repository: FundingRepository, settings: Settings
+) -> FundingHistoryService:
+    window_minutes = max(
+        settings.window_cache_minutes,
+        settings.candidate_long_window_minutes,
+        settings.candidate_primary_window_minutes,
+        settings.candidate_short_window_minutes,
+    )
+    return FundingHistoryService(
+        repository=repository,
+        window_cache_minutes=window_minutes,
+        default_metrics_window=settings.candidate_primary_window_minutes,
+        abs_threshold=settings.candidate_min_funding_rate,
+    )
+
+
+def _candidate_config_from_settings(settings: Settings) -> CandidateEngineConfig:
+    return CandidateEngineConfig(
+        enabled=settings.candidate_engine_enabled,
+        min_funding_rate=settings.candidate_min_funding_rate,
+        min_history_minutes=settings.candidate_min_history_minutes,
+        primary_window_minutes=settings.candidate_primary_window_minutes,
+        short_window_minutes=settings.candidate_short_window_minutes,
+        long_window_minutes=settings.candidate_long_window_minutes,
+        min_snapshot_count=settings.candidate_min_snapshot_count,
+        max_snapshot_age_seconds=settings.candidate_max_snapshot_age_seconds,
+        min_persistence_ratio=settings.candidate_min_persistence_ratio,
+        max_std_dev=settings.candidate_max_std_dev,
+        max_threshold_crossings=settings.candidate_max_threshold_crossings,
+        max_direction_changes=settings.candidate_max_direction_changes,
+        late_spike_lookback_minutes=settings.candidate_late_spike_lookback_minutes,
+        late_spike_min_jump_ratio=settings.candidate_late_spike_min_jump_ratio,
+        deterioration_lookback_minutes=settings.candidate_deterioration_lookback_minutes,
+        max_negative_velocity=settings.candidate_max_negative_velocity,
+        min_minutes_to_funding=settings.candidate_min_minutes_to_funding,
+        max_minutes_to_funding=settings.candidate_max_minutes_to_funding,
+        strong_score=settings.candidate_strong_score,
+        min_score=settings.candidate_min_score,
+        persist_interval_seconds=settings.candidate_persist_interval_seconds,
+        max_results=settings.candidate_max_results,
+        interval_point_tolerance_seconds=(
+            settings.funding_interval_point_tolerance_seconds
+        ),
+        interval_summary_batch_size=settings.funding_interval_summary_batch_size,
+    )
+
+
+def _decimal_arg(value: str) -> Decimal:
+    return decimal_from_text(value)
 
 
 def _print_history_summary(summary: WindowCacheSummary) -> None:
@@ -377,6 +505,138 @@ def _print_mapping_details(mappings: list[InstrumentMapping]) -> None:
                 ]
             )
         )
+
+
+def _filter_candidate_evaluations(
+    evaluations: list[CandidateEvaluation],
+    *,
+    statuses: list[CandidateStatus],
+    symbol: str | None,
+    min_score: Decimal | None,
+    include_rejected: bool,
+    limit: int,
+) -> list[CandidateEvaluation]:
+    rejected_statuses = {
+        CandidateStatus.REJECTED,
+        CandidateStatus.STALE,
+        CandidateStatus.INSUFFICIENT_HISTORY,
+        CandidateStatus.EXPIRED,
+    }
+    filtered = []
+    for evaluation in evaluations:
+        if statuses and evaluation.status not in statuses:
+            continue
+        if symbol is not None and evaluation.futures_symbol != symbol:
+            continue
+        if min_score is not None and evaluation.total_score < min_score:
+            continue
+        if not statuses and not include_rejected and evaluation.status in rejected_statuses:
+            continue
+        filtered.append(evaluation)
+    return rank_evaluations(filtered)[:limit]
+
+
+def _print_candidates(evaluations: list[CandidateEvaluation]) -> None:
+    print(
+        "rank futures_symbol spot_symbol predicted_funding score status "
+        "persistence velocity std signal_age_seconds minutes_to_funding "
+        "flags reasons"
+    )
+    for rank, evaluation in enumerate(evaluations, start=1):
+        print(
+            " ".join(
+                [
+                    str(rank),
+                    _optional_text(evaluation.futures_symbol),
+                    _optional_text(evaluation.spot_symbol) or "-",
+                    _optional_text(evaluation.predicted_funding_rate),
+                    _optional_text(evaluation.total_score),
+                    _optional_text(evaluation.status.value),
+                    _optional_text(evaluation.persistence_ratio),
+                    _optional_text(evaluation.velocity),
+                    _optional_text(evaluation.standard_deviation),
+                    _optional_text(evaluation.signal_age_seconds),
+                    _optional_text(evaluation.minutes_to_funding),
+                    _reason_codes(evaluation.warning_flags),
+                    _reason_codes(evaluation.rejection_reasons),
+                ]
+            )
+        )
+
+
+def _print_candidates_json(evaluations: list[CandidateEvaluation]) -> None:
+    rows = [_candidate_json_row(evaluation) for evaluation in evaluations]
+    print(json.dumps(rows, ensure_ascii=False, sort_keys=True))
+
+
+def _candidate_json_row(evaluation: CandidateEvaluation) -> dict[str, object]:
+    return {
+        "futures_symbol": evaluation.futures_symbol,
+        "spot_symbol": evaluation.spot_symbol,
+        "evaluated_at": evaluation.evaluated_at.isoformat(),
+        "next_funding_time": evaluation.next_funding_time.isoformat()
+        if evaluation.next_funding_time is not None
+        else None,
+        "predicted_funding_rate": str(evaluation.predicted_funding_rate),
+        "minimum_funding_rate": str(evaluation.minimum_funding_rate),
+        "minutes_to_funding": str(evaluation.minutes_to_funding)
+        if evaluation.minutes_to_funding is not None
+        else None,
+        "status": evaluation.status.value,
+        "total_score": str(evaluation.total_score),
+        "score_details": evaluation.score_details,
+        "persistence_ratio": str(evaluation.persistence_ratio)
+        if evaluation.persistence_ratio is not None
+        else None,
+        "standard_deviation": str(evaluation.standard_deviation)
+        if evaluation.standard_deviation is not None
+        else None,
+        "velocity": str(evaluation.velocity)
+        if evaluation.velocity is not None
+        else None,
+        "acceleration": str(evaluation.acceleration)
+        if evaluation.acceleration is not None
+        else None,
+        "signal_age_seconds": evaluation.signal_age_seconds,
+        "snapshot_count": evaluation.snapshot_count,
+        "history_duration_seconds": evaluation.history_duration_seconds,
+        "rejection_reasons": [
+            reason.value for reason in evaluation.rejection_reasons
+        ],
+        "warning_flags": [flag.value for flag in evaluation.warning_flags],
+        "metrics_details": evaluation.metrics_details,
+        "engine_version": evaluation.engine_version,
+    }
+
+
+def _print_candidate_rejections(
+    aggregates: list[CandidateRejectionAggregate],
+) -> None:
+    print("reason symbol_count percentage examples")
+    for aggregate in aggregates:
+        print(
+            " ".join(
+                [
+                    aggregate.reason.value,
+                    str(aggregate.symbol_count),
+                    str(aggregate.percentage),
+                    ",".join(aggregate.examples) or "-",
+                ]
+            )
+        )
+
+
+def _print_interval_build_result(result: FundingIntervalBuildResult) -> None:
+    print(f"processed: {result.processed}")
+    print(f"created: {result.created}")
+    print(f"updated: {result.updated}")
+    print(f"partial: {result.partial}")
+    print(f"skipped: {result.skipped}")
+    print(f"failed: {result.failed}")
+
+
+def _reason_codes(reasons: tuple[RejectionReason, ...]) -> str:
+    return ",".join(reason.value for reason in reasons) or "-"
 
 
 def _print_metrics(metrics: FundingMetrics) -> None:

@@ -25,6 +25,9 @@
 - Funding History Engine maintains an in-memory per-symbol snapshot window loaded from PostgreSQL.
 - `history` and `metrics` commands expose cache and per-symbol window metrics.
 - Spot to Futures Instrument Mapping stores metadata-only execution eligibility for supported USDT instruments.
+- Stage 3 Positive Funding Candidate Engine evaluates current positive funding opportunities with rule-based statuses, score components, rejection reasons, and persistence into PostgreSQL.
+- Funding Interval Analytics Foundation links confirmed realized funding events with their predicted snapshots for future reliability analysis.
+- Funding Intelligence foundation prepares exchange-aware symbol profiles without using them yet.
 - Live confirmation has been verified for `COTIUSDT`, `DEXEUSDT`, `ERAUSDT`, and `ESPORTSUSDT`.
 - `confirmation_failed` was `0` in the verified live run.
 - `ruff`, `mypy`, and `pytest` pass for the current implementation.
@@ -37,14 +40,14 @@ It does not use SQLAlchemy, Docker, FastAPI, private Binance endpoints, API keys
 
 ### Strategy Rules
 
-1. The system must work with both positive and negative funding.
-2. The minimum absolute gross funding threshold is `0.03%`, represented as `Decimal("0.0003")` in Binance API values.
-3. The first candidate threshold is `abs(funding_rate) >= Decimal("0.0003")`.
-4. Positive funding direction means short perpetual plus long spot. Negative funding direction means long perpetual plus short spot or borrowed spot asset.
-5. Raw data continues to be collected for all active symbols.
-6. Symbols below the threshold are not removed from historical collection. They are only excluded from later expensive analytics and signal workflows.
-7. A high current funding value is not a signal by itself.
-8. Later analytics must consider time to funding, persistence above threshold, funding direction, sign changes, late spikes, funding drops before payment, funding velocity, funding acceleration, mark/index premium, price movement, volatility, liquidity, spread, depth, slippage, spot hedge availability, borrow availability and cost, fees, funding interval, caps/floors, expected net edge, and historical symbol reliability.
+1. Stage 3 candidate detection evaluates only positive funding.
+2. The supported strategy is long Spot plus short USD-M perpetual futures.
+3. The minimum gross predicted funding threshold is `0.03%`, represented as `Decimal("0.0003")` in Binance API values.
+4. Raw data continues to be collected for all active symbols and all funding directions.
+5. Symbols below the threshold are not removed from historical collection. They are only excluded from candidate workflows.
+6. A high current predicted funding value is not a signal by itself.
+7. Candidate quality also considers persistence, stability, trend, signal lifetime, time to funding, spot hedge availability, and data quality.
+8. Realized funding from confirmed events must not be replaced by maximum predicted funding inside an interval.
 9. The first mode is observation-only. The project must not place orders or perform real trading.
 
 ### Roadmap
@@ -53,16 +56,12 @@ It does not use SQLAlchemy, Docker, FastAPI, private Binance endpoints, API keys
 - Stage 2: analytical data foundation - completed.
 - Stage 2.2: Funding History Engine - completed.
 - Stage 2.3: Instrument Mapping - completed.
-- Stage 2.4: Margin Borrow Availability or Candidate Detection, depending on the approved plan.
-- Stage 3: candidate detection.
-- Stage 4: time-window logic.
-- Stage 5: stability engine.
-- Stage 6: market risk and liquidity.
-- Stage 7: net edge.
-- Stage 8: scoring.
-- Stage 9: symbol reliability.
-- Stage 10: observation mode.
-- Stage 11: notifications/UI/paper trading.
+- Stage 3: Positive Funding Candidate Engine - completed.
+- Stage 4: market risk, spread, fees, depth, and slippage.
+- Stage 5: net edge.
+- Stage 6: symbol reliability.
+- Stage 7: realized candidate outcomes.
+- Stage 8: notifications/UI/paper trading.
 
 ## Requirements
 
@@ -93,6 +92,30 @@ DEFAULT_METRICS_WINDOW=60
 BINANCE_SPOT_BASE_URL=https://api.binance.com
 SUPPORTED_SPOT_QUOTE_ASSET=USDT
 INSTRUMENT_MAPPING_SYNC_ON_STARTUP=false
+CANDIDATE_ENGINE_ENABLED=true
+CANDIDATE_MIN_FUNDING_RATE=0.0003
+CANDIDATE_MIN_HISTORY_MINUTES=15
+CANDIDATE_PRIMARY_WINDOW_MINUTES=30
+CANDIDATE_SHORT_WINDOW_MINUTES=5
+CANDIDATE_LONG_WINDOW_MINUTES=60
+CANDIDATE_MIN_SNAPSHOT_COUNT=10
+CANDIDATE_MAX_SNAPSHOT_AGE_SECONDS=120
+CANDIDATE_MIN_PERSISTENCE_RATIO=0.70
+CANDIDATE_MAX_STD_DEV=0.0002
+CANDIDATE_MAX_THRESHOLD_CROSSINGS=4
+CANDIDATE_MAX_DIRECTION_CHANGES=8
+CANDIDATE_LATE_SPIKE_LOOKBACK_MINUTES=5
+CANDIDATE_LATE_SPIKE_MIN_JUMP_RATIO=1.50
+CANDIDATE_DETERIORATION_LOOKBACK_MINUTES=5
+CANDIDATE_MAX_NEGATIVE_VELOCITY=-0.00002
+CANDIDATE_MIN_MINUTES_TO_FUNDING=5
+CANDIDATE_MAX_MINUTES_TO_FUNDING=480
+CANDIDATE_STRONG_SCORE=80
+CANDIDATE_MIN_SCORE=60
+CANDIDATE_PERSIST_INTERVAL_SECONDS=60
+CANDIDATE_MAX_RESULTS=50
+FUNDING_INTERVAL_POINT_TOLERANCE_SECONDS=90
+FUNDING_INTERVAL_SUMMARY_BATCH_SIZE=500
 ```
 
 `ABS_MIN_FUNDING_RATE` is used for status and aggregate reporting. It does not stop snapshots below the threshold from being saved.
@@ -100,6 +123,8 @@ INSTRUMENT_MAPPING_SYNC_ON_STARTUP=false
 `WINDOW_CACHE_MINUTES` controls the in-memory per-symbol history cache. `DEFAULT_METRICS_WINDOW` controls the default window used by the `metrics` command.
 
 `BINANCE_SPOT_BASE_URL` is used only for public Spot `exchangeInfo`. `SUPPORTED_SPOT_QUOTE_ASSET` is currently `USDT`. `INSTRUMENT_MAPPING_SYNC_ON_STARTUP` is present for future startup integration and defaults to `false`.
+
+Candidate velocity and acceleration use funding-rate change per second, matching `FundingHistoryService`.
 
 In Supabase, get the PostgreSQL connection string from Project Settings, Database, Connection string. For local development, use the Session Pooler connection string when available.
 
@@ -126,6 +151,17 @@ python -m funding_monitor instrument-mappings
 python -m funding_monitor instrument-mappings --status matched
 python -m funding_monitor instrument-mappings --status ambiguous
 python -m funding_monitor instrument-mappings --symbol BTCUSDT
+python -m funding_monitor candidates
+python -m funding_monitor candidates --top 20
+python -m funding_monitor candidates --min-score 60
+python -m funding_monitor candidates --status candidate
+python -m funding_monitor candidates --status strong_candidate
+python -m funding_monitor candidates --symbol BTCUSDT
+python -m funding_monitor candidates --include-rejected
+python -m funding_monitor candidates --no-persist
+python -m funding_monitor candidates --json
+python -m funding_monitor candidate-rejections
+python -m funding_monitor build-funding-interval-summaries
 python -m funding_monitor recent-events --limit 20
 python -m funding_monitor export-csv --output data/funding_events.csv
 ```
@@ -143,6 +179,12 @@ python -m funding_monitor export-csv --output data/funding_events.csv
 `funding_events` stores one row per symbol and funding time, including checkpoint predictions, actual funding rate, prediction error, confirmation status, and the next predicted rate seen after funding.
 
 `instrument_mappings` stores metadata-only Spot to Futures mapping status and strategy availability for futures symbols. It is not tied to current funding thresholds and does not create trading signals.
+
+`candidate_evaluations` stores controlled current candidate evaluation snapshots with status, score components, penalties, rejection reasons, warning flags, metrics details, and engine version.
+
+`funding_interval_summaries` stores aggregated predicted funding behavior inside a funding interval and links it to the confirmed realized funding event. It is exchange-aware and includes peak predicted timestamp, signal start, and positive streak fields for future analytics.
+
+`symbol_funding_profiles` is a prepared table for the future Funding Intelligence Engine. Stage 3 does not populate it.
 
 ## Funding History Engine
 
@@ -169,6 +211,32 @@ Mapping statuses are `matched`, `missing`, `ambiguous`, `unsupported`, and `spot
 Multiplier contracts such as `1000PEPEUSDT` are marked `ambiguous`. They are not automatically mapped to `PEPEUSDT` because the quantity multiplier must be explicit before execution logic can be safe.
 
 The mapping layer does not implement Margin API, API keys, borrow availability, fees, order book data, scoring, candidate detection, paper trading, or real orders.
+
+## Stage 3 Candidate Engine
+
+Stage 3 evaluates only positive funding opportunities for long Spot plus short perpetual futures. It requires a matched instrument mapping and an active spot pair before a symbol can become a candidate.
+
+Statuses are `strong_candidate`, `candidate`, `weak_candidate`, `observing`, `deteriorating`, `funding_falling`, `unstable`, `late_spike`, `too_early`, `too_late`, `stale`, `insufficient_history`, `rejected`, and `expired`.
+
+Score components are funding magnitude, persistence, stability, trend, signal lifetime, and time to funding. Penalties cover late spikes, deterioration, stale data, insufficient history, instability, threshold crossings, and too-close-to-funding risk.
+
+Score calculation is split into dedicated calculators. `CandidateScoringService` only assembles the score and keeps the existing formulas unchanged.
+
+The command `python -m funding_monitor candidates` computes current evaluations from existing snapshots, history metrics, and instrument mappings. It persists one row per symbol per configured time bucket unless `--no-persist` is used.
+
+The command `python -m funding_monitor candidate-rejections` aggregates machine-readable rejection reasons from latest persisted evaluations.
+
+The command `python -m funding_monitor build-funding-interval-summaries` builds idempotent summaries that compare predicted snapshots with confirmed realized funding. Realized funding always comes from confirmed `funding_events.actual_funding_rate`.
+
+See `STAGE_3_CANDIDATE_ENGINE.md` for full details.
+
+## Funding Intelligence Foundation
+
+The future Funding Intelligence Engine will operate on `funding_interval_summaries`, not on current WebSocket snapshots. It will build exchange-aware symbol profiles and keep Signal Frequency separate from Realized Reliability.
+
+Signal Frequency means how often predicted funding became high. Realized Reliability means how often a high predicted signal ended as a high confirmed payout.
+
+The placeholder module is `src/funding_monitor/funding_intelligence.py`.
 
 ## Predicted Rate And Actual Rate
 
